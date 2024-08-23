@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+// SPDX-License-Identifier: (GPL-3.0 OR PolyForm-Strict-1.0.0)
 
 #include "input_manager.h"
 #include "common/assert.h"
@@ -28,7 +28,7 @@
 #include <variant>
 #include <vector>
 
-LOG_CHANNEL(InputManager);
+Log_SetChannel(InputManager);
 
 namespace {
 
@@ -302,7 +302,7 @@ bool InputManager::ParseBindingAndGetSource(std::string_view binding, InputBindi
 
 std::string InputManager::ConvertInputBindingKeyToString(InputBindingInfo::Type binding_type, InputBindingKey key)
 {
-  if (binding_type == InputBindingInfo::Type::Pointer)
+  if (binding_type == InputBindingInfo::Type::Pointer || binding_type == InputBindingInfo::Type::AbsolutePointer)
   {
     // pointer and device bindings don't have a data part
     if (key.source_type == InputSourceType::Pointer)
@@ -355,7 +355,7 @@ std::string InputManager::ConvertInputBindingKeysToString(InputBindingInfo::Type
                                                           const InputBindingKey* keys, size_t num_keys)
 {
   // can't have a chord of devices/pointers
-  if (binding_type == InputBindingInfo::Type::Pointer)
+  if (binding_type == InputBindingInfo::Type::Pointer || binding_type == InputBindingInfo::Type::AbsolutePointer)
   {
     // so only take the first
     if (num_keys > 0)
@@ -607,12 +607,11 @@ static std::array<const char*, static_cast<u32>(InputSourceType::Count)> s_input
 #ifdef _WIN32
   "DInput",
   "XInput",
-  "RawInput",
 #endif
-#ifdef ENABLE_SDL
+#ifndef __ANDROID__
   "SDL",
-#endif
-#ifdef __ANDROID__
+  "RawInput",
+#else
   "Android",
 #endif
 }};
@@ -641,17 +640,14 @@ bool InputManager::GetInputSourceDefaultEnabled(InputSourceType type)
 
     case InputSourceType::XInput:
       return false;
-
-    case InputSourceType::RawInput:
-      return false;
 #endif
 
-#ifdef ENABLE_SDL
+#ifndef __ANDROID__
     case InputSourceType::SDL:
       return true;
-#endif
-
-#ifdef __ANDROID__
+    case InputSourceType::RawInput:
+      return false;
+#else
     case InputSourceType::Android:
       return true;
 #endif
@@ -857,6 +853,7 @@ void InputManager::AddPadBindings(SettingsInterface& si, const std::string& sect
       break;
 
       case InputBindingInfo::Type::Pointer:
+      case InputBindingInfo::Type::AbsolutePointer:
       {
         auto cb = [pad_index, base = bi.bind_index](InputBindingKey key, float value) {
           if (!System::IsValid())
@@ -1036,8 +1033,7 @@ bool InputManager::ProcessEvent(InputBindingKey key, float value, bool skip_butt
       else if (binding->num_keys >= min_num_keys)
       {
         // update state based on whether the whole chord was activated
-        const u8 new_mask =
-          ((new_state && !skip_button_handlers) ? (binding->current_mask | bit) : (binding->current_mask & ~bit));
+        const u8 new_mask = (new_state ? (binding->current_mask | bit) : (binding->current_mask & ~bit));
         const bool prev_full_state = (binding->current_mask == binding->full_mask);
         const bool new_full_state = (new_mask == binding->full_mask);
         binding->current_mask = new_mask;
@@ -1146,7 +1142,7 @@ void InputManager::ClearBindStateFromSource(InputBindingKey key)
 
         if (current_mask == binding->full_mask)
         {
-          std::get<InputButtonEventHandler>(binding->handler)(-1);
+          std::get<InputButtonEventHandler>(binding->handler)(0);
           matched = true;
           break;
         }
@@ -1191,9 +1187,6 @@ void InputManager::GenerateRelativeMouseEvents()
     {
       PointerAxisState& state = s_pointer_state[device][axis];
       const float delta = static_cast<float>(state.delta.exchange(0, std::memory_order_acquire)) / 65536.0f;
-      if (delta == 0.0f)
-        continue;
-
       const float unclamped_value = delta * s_pointer_axis_scale[axis];
 
       const InputBindingKey key(MakePointerAxisKey(device, static_cast<InputPointerAxis>(axis)));
@@ -1233,7 +1226,7 @@ void InputManager::UpdatePointerCount()
     return;
   }
 
-#ifdef _WIN32
+#ifndef __ANDROID__
   InputSource* ris = GetInputSourceInterface(InputSourceType::RawInput);
   DebugAssert(ris);
 
@@ -1283,7 +1276,7 @@ void InputManager::UpdatePointerAbsolutePosition(u32 index, float x, float y)
 
 void InputManager::UpdatePointerRelativeDelta(u32 index, InputPointerAxis axis, float d, bool raw_input)
 {
-  if (index >= MAX_POINTER_DEVICES || (axis < InputPointerAxis::WheelX && !s_relative_mouse_mode_active))
+  if (index >= MAX_POINTER_DEVICES || !s_relative_mouse_mode_active)
     return;
 
   s_host_pointer_positions[index][static_cast<u8>(axis)] += d;
@@ -1816,7 +1809,8 @@ bool InputManager::DoEventHook(InputBindingKey key, float value)
 // Binding Updater
 // ------------------------------------------------------------------------
 
-void InputManager::ReloadBindings(SettingsInterface& binding_si, SettingsInterface& hotkey_binding_si)
+void InputManager::ReloadBindings(SettingsInterface& si, SettingsInterface& binding_si,
+                                  SettingsInterface& hotkey_binding_si)
 {
   PauseVibration();
 
@@ -1849,8 +1843,8 @@ void InputManager::ReloadBindings(SettingsInterface& binding_si, SettingsInterfa
     // From lilypad: 1 mouse pixel = 1/8th way down.
     const float default_scale = (axis <= static_cast<u32>(InputPointerAxis::Y)) ? 8.0f : 1.0f;
     s_pointer_axis_scale[axis] =
-      1.0f / std::max(binding_si.GetFloatValue("Pad", fmt::format("Pointer{}Scale", s_pointer_axis_names[axis]).c_str(),
-                                               default_scale),
+      1.0f / std::max(si.GetFloatValue("Pad", fmt::format("Pointer{}Scale", s_pointer_axis_names[axis]).c_str(),
+                                       default_scale),
                       1.0f);
   }
 
@@ -2052,10 +2046,9 @@ void InputManager::ReloadSources(SettingsInterface& si, std::unique_lock<std::mu
   UpdateInputSourceState(si, settings_lock, InputSourceType::XInput, &InputSource::CreateXInputSource);
   UpdateInputSourceState(si, settings_lock, InputSourceType::RawInput, &InputSource::CreateWin32RawInputSource);
 #endif
-#ifdef ENABLE_SDL
+#ifndef __ANDROID__
   UpdateInputSourceState(si, settings_lock, InputSourceType::SDL, &InputSource::CreateSDLSource);
-#endif
-#ifdef __ANDROID__
+#else
   UpdateInputSourceState(si, settings_lock, InputSourceType::Android, &InputSource::CreateAndroidSource);
 #endif
 

@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+// SPDX-FileCopyrightText: 2022-2023 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
 
 #pragma once
 #include "types.h"
@@ -15,7 +15,8 @@ struct InputBindingInfo
     Axis,
     HalfAxis,
     Motor,
-    Pointer, // Receive relative mouse movement events, bind_index is offset by the axis.
+    Pointer,         // Receive relative mouse movement events, bind_index is offset by the axis.
+    AbsolutePointer, // Allows selection of specific pointers, but defaults to the first.
     Macro,
   };
 

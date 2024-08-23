@@ -1,21 +1,20 @@
 // SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+// SPDX-License-Identifier: (GPL-3.0 OR PolyForm-Strict-1.0.0)
 
 #include "win32_raw_input_source.h"
-#include "input_manager.h"
-
 #include "common/assert.h"
 #include "common/log.h"
 #include "common/string_util.h"
-
-#include "fmt/format.h"
+#include "core/host.h"
+#include "core/system.h"
+#include "input_manager.h"
 
 #include <cmath>
 #include <hidsdi.h>
 #include <hidusage.h>
 #include <malloc.h>
 
-LOG_CHANNEL(Win32RawInputSource);
+Log_SetChannel(Win32RawInputSource);
 
 static const wchar_t* WINDOW_CLASS_NAME = L"Win32RawInputSource";
 static bool s_window_class_registered = false;

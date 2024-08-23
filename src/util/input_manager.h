@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+// SPDX-License-Identifier: (GPL-3.0 OR PolyForm-Strict-1.0.0)
 
 #pragma once
 
@@ -27,12 +27,11 @@ enum class InputSourceType : u32
 #ifdef _WIN32
   DInput,
   XInput,
-  RawInput,
 #endif
-#ifdef ENABLE_SDL
+#ifndef __ANDROID__
   SDL,
-#endif
-#ifdef __ANDROID__
+  RawInput,
+#else
   Android,
 #endif
   Count,
@@ -254,7 +253,7 @@ GenericInputBindingMapping GetGenericBindingMapping(std::string_view device);
 bool IsInputSourceEnabled(SettingsInterface& si, InputSourceType type);
 
 /// Re-parses the config and registers all hotkey and pad bindings.
-void ReloadBindings(SettingsInterface& si, SettingsInterface& hotkey_binding_si);
+void ReloadBindings(SettingsInterface& si, SettingsInterface& binding_si, SettingsInterface& hotkey_binding_si);
 
 /// Re-parses the sources part of the config and initializes any backends.
 void ReloadSources(SettingsInterface& si, std::unique_lock<std::mutex>& settings_lock);
