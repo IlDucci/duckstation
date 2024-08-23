@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
 
 #include "justifier.h"
 #include "gpu.h"
@@ -19,7 +19,7 @@
 #include "IconsPromptFont.h"
 #include <array>
 
-LOG_CHANNEL(Controller);
+Log_SetChannel(Justifier);
 
 // #define CHECK_TIMING 1
 #ifdef CHECK_TIMING
@@ -336,7 +336,7 @@ static const Controller::ControllerBindingInfo s_binding_info[] = {
   }
 
   // clang-format off
-  {"Pointer", TRANSLATE_NOOP("Justifier", "Pointer/Aiming"), ICON_PF_MOUSE, static_cast<u32>(Justifier::Binding::ButtonCount), InputBindingInfo::Type::Pointer, GenericInputBinding::Unknown},
+  {"Pointer", TRANSLATE_NOOP("Justifier", "Pointer/Aiming"), ICON_PF_MOUSE, static_cast<u32>(Justifier::Binding::ButtonCount), InputBindingInfo::Type::AbsolutePointer, GenericInputBinding::Unknown},
   BUTTON("Trigger", TRANSLATE_NOOP("Justifier", "Trigger"), ICON_PF_CROSS, Justifier::Binding::Trigger, GenericInputBinding::R2),
   BUTTON("ShootOffscreen", TRANSLATE_NOOP("Justifier", "Shoot Offscreen"), nullptr, Justifier::Binding::ShootOffscreen, GenericInputBinding::L2),
   BUTTON("Start", TRANSLATE_NOOP("Justifier", "Start"), ICON_PF_START, Justifier::Binding::Start, GenericInputBinding::Cross),
@@ -397,7 +397,7 @@ static const SettingInfo s_settings[] = {
 const Controller::ControllerInfo Justifier::INFO = {ControllerType::Justifier,
                                                     "Justifier",
                                                     TRANSLATE_NOOP("ControllerType", "Justifier"),
-                                                    ICON_PF_LIGHT_GUN,
+                                                    nullptr,
                                                     s_binding_info,
                                                     s_settings,
                                                     Controller::VibrationCapabilities::NoVibration};
