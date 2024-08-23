@@ -12,8 +12,6 @@
 #include "common/bitutils.h"
 #include "common/log.h"
 
-#include "fmt/format.h"
-
 #include <QtCore/QTimer>
 #include <QtGui/QKeyEvent>
 #include <QtGui/QMouseEvent>
