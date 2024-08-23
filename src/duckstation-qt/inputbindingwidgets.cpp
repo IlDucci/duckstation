@@ -230,7 +230,7 @@ void InputBindingWidget::setNewBinding()
     {
       Host::SetBaseStringSettingValue(m_section_name.c_str(), m_key_name.c_str(), new_binding.c_str());
       Host::CommitBaseSettingChanges();
-      if (m_bind_type == InputBindingInfo::Type::Pointer)
+      if (m_bind_type == InputBindingInfo::Type::Pointer || m_bind_type == InputBindingInfo::Type::AbsolutePointer)
         g_emu_thread->updateControllerSettings();
       g_emu_thread->reloadInputBindings();
     }
@@ -253,7 +253,7 @@ void InputBindingWidget::clearBinding()
   {
     Host::DeleteBaseSettingValue(m_section_name.c_str(), m_key_name.c_str());
     Host::CommitBaseSettingChanges();
-    if (m_bind_type == InputBindingInfo::Type::Pointer)
+    if (m_bind_type == InputBindingInfo::Type::Pointer || m_bind_type == InputBindingInfo::Type::AbsolutePointer)
       g_emu_thread->updateControllerSettings();
     g_emu_thread->reloadInputBindings();
   }
