@@ -12,8 +12,6 @@
 #include "common/assert.h"
 #include "common/bitutils.h"
 
-#include "fmt/format.h"
-
 #include <QtCore/QTimer>
 #include <QtGui/QKeyEvent>
 #include <QtGui/QMouseEvent>
