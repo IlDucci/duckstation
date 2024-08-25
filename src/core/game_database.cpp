@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
 
 #include "game_database.h"
 #include "controller.h"
@@ -29,20 +29,18 @@
 
 #include "IconsEmoji.h"
 #include "IconsFontAwesome5.h"
-#include "fmt/format.h"
 
-LOG_CHANNEL(GameDatabase);
-
-#include "common/ryml_helpers.h"
+Log_SetChannel(GameDatabase);
 
 namespace GameDatabase {
 
 enum : u32
 {
   GAME_DATABASE_CACHE_SIGNATURE = 0x45434C48,
-  GAME_DATABASE_CACHE_VERSION = 17,
+  GAME_DATABASE_CACHE_VERSION = 14,
 };
 
+static Entry* GetMutableEntry(std::string_view serial);
 static const Entry* GetEntryForId(std::string_view code);
 
 static bool LoadFromCache();
@@ -51,43 +49,33 @@ static bool SaveToCache();
 static void SetRymlCallbacks();
 static bool LoadGameDBYaml();
 static bool ParseYamlEntry(Entry* entry, const ryml::ConstNodeRef& value);
-static bool ParseYamlCodes(PreferUnorderedStringMap<std::string_view>& lookup, const ryml::ConstNodeRef& value,
-                           std::string_view serial);
+static bool ParseYamlCodes(u32 index, const ryml::ConstNodeRef& value, std::string_view serial);
 static bool LoadTrackHashes();
 
 static constexpr const std::array<const char*, static_cast<int>(CompatibilityRating::Count)>
-  s_compatibility_rating_names = {{
-    "Unknown",
-    "DoesntBoot",
-    "CrashesInIntro",
-    "CrashesInGame",
-    "GraphicalAudioIssues",
-    "NoIssues",
-  }};
+  s_compatibility_rating_names = {
+    {"Unknown", "DoesntBoot", "CrashesInIntro", "CrashesInGame", "GraphicalAudioIssues", "NoIssues"}};
 
 static constexpr const std::array<const char*, static_cast<size_t>(CompatibilityRating::Count)>
-  s_compatibility_rating_display_names = {{
-    TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Unknown", "CompatibilityRating"),
-    TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Doesn't Boot", "CompatibilityRating"),
-    TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Crashes In Intro", "CompatibilityRating"),
-    TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Crashes In-Game", "CompatibilityRating"),
-    TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Graphical/Audio Issues", "CompatibilityRating"),
-    TRANSLATE_DISAMBIG_NOOP("GameDatabase", "No Issues", "CompatibilityRating"),
-  }};
+  s_compatibility_rating_display_names = {
+    {TRANSLATE_NOOP("GameDatabase", "Unknown"), TRANSLATE_NOOP("GameDatabase", "Doesn't Boot"),
+     TRANSLATE_NOOP("GameDatabase", "Crashes In Intro"), TRANSLATE_NOOP("GameDatabase", "Crashes In-Game"),
+     TRANSLATE_NOOP("GameDatabase", "Graphical/Audio Issues"), TRANSLATE_NOOP("GameDatabase", "No Issues")}};
 
-static constexpr const std::array<const char*, static_cast<size_t>(Trait::MaxCount)> s_trait_names = {{
+static constexpr const std::array<const char*, static_cast<u32>(GameDatabase::Trait::Count)> s_trait_names = {{
   "ForceInterpreter",
   "ForceSoftwareRenderer",
   "ForceSoftwareRendererForReadbacks",
   "ForceRoundTextureCoordinates",
   "ForceAccurateBlending",
-  "ForceDeinterlacing",
+  "ForceInterlacing",
   "DisableAutoAnalogMode",
   "DisableTrueColor",
   "DisableUpscaling",
   "DisableTextureFiltering",
   "DisableSpriteTextureFiltering",
   "DisableScaledDithering",
+  "DisableForceNTSCTimings",
   "DisableWidescreen",
   "DisablePGXP",
   "DisablePGXPCulling",
@@ -101,59 +89,163 @@ static constexpr const std::array<const char*, static_cast<size_t>(Trait::MaxCou
   "ForceRecompilerMemoryExceptions",
   "ForceRecompilerICache",
   "ForceRecompilerLUTFastmem",
-  "ForceCDROMSubQSkew",
   "IsLibCryptProtected",
 }};
 
-static constexpr const std::array<const char*, static_cast<size_t>(Trait::MaxCount)> s_trait_display_names = {{
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Force Interpreter", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Force Software Renderer", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Force Software Renderer For Readbacks", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Force Round Texture Coordinates", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Force Accurate Blending", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Force Deinterlacing", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Disable Automatic Analog Mode", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Disable True Color", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Disable Upscaling", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Disable Texture Filtering", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Disable Sprite Texture Filtering", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Disable Scaled Dithering", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Disable Widescreen", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Disable PGXP", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Disable PGXP Culling", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Disable PGXP Texture Correction", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Disable PGXP Color Correction", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Disable PGXP Depth Buffer", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Disable PGXP Preserve Projection Floating Point", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Disable PGXP on 2D Polygons", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Force PGXP Vertex Cache", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Force PGXP CPU Mode", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Force Recompiler Memory Exceptions", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Force Recompiler ICache", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Force Recompiler LUT Fastmem", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Force CD-ROM SubQ Skew", "GameDatabase::Trait"),
-  TRANSLATE_DISAMBIG_NOOP("GameDatabase", "Is LibCrypt Protected", "GameDatabase::Trait"),
-}};
-
-static constexpr std::array<const char*, static_cast<size_t>(Language::MaxCount)> s_language_names = {{
-  "Catalan", "Chinese",   "Czech",  "Danish",     "Dutch",   "English", "Finnish",
-  "French",  "German",    "Greek",  "Hebrew",     "Iranian", "Italian", "Japanese",
-  "Korean",  "Norwegian", "Polish", "Portuguese", "Russian", "Spanish", "Swedish",
+static constexpr const std::array<const char*, static_cast<u32>(GameDatabase::Trait::Count)> s_trait_display_names = {{
+  TRANSLATE_NOOP("GameDatabase", "Force Interpreter"),
+  TRANSLATE_NOOP("GameDatabase", "Force Software Renderer"),
+  TRANSLATE_NOOP("GameDatabase", "Force Software Renderer For Readbacks"),
+  TRANSLATE_NOOP("GameDatabase", "Force Round Texture Coordinates"),
+  TRANSLATE_NOOP("GameDatabase", "Force Accurate Blending"),
+  TRANSLATE_NOOP("GameDatabase", "Force Interlacing"),
+  TRANSLATE_NOOP("GameDatabase", "Disable Automatic Analog Mode"),
+  TRANSLATE_NOOP("GameDatabase", "Disable True Color"),
+  TRANSLATE_NOOP("GameDatabase", "Disable Upscaling"),
+  TRANSLATE_NOOP("GameDatabase", "Disable Texture Filtering"),
+  TRANSLATE_NOOP("GameDatabase", "Disable Sprite Texture Filtering"),
+  TRANSLATE_NOOP("GameDatabase", "Disable Scaled Dithering"),
+  TRANSLATE_NOOP("GameDatabase", "Disable Force NTSC Timings"),
+  TRANSLATE_NOOP("GameDatabase", "Disable Widescreen"),
+  TRANSLATE_NOOP("GameDatabase", "Disable PGXP"),
+  TRANSLATE_NOOP("GameDatabase", "Disable PGXP Culling"),
+  TRANSLATE_NOOP("GameDatabase", "Disable PGXP Texture Correction"),
+  TRANSLATE_NOOP("GameDatabase", "Disable PGXP Color Correction"),
+  TRANSLATE_NOOP("GameDatabase", "Disable PGXP Depth Buffer"),
+  TRANSLATE_NOOP("GameDatabase", "Disable PGXP Preserve Projection Floating Point"),
+  TRANSLATE_NOOP("GameDatabase", "Disable PGXP on 2D Polygons"),
+  TRANSLATE_NOOP("GameDatabase", "Force PGXP Vertex Cache"),
+  TRANSLATE_NOOP("GameDatabase", "Force PGXP CPU Mode"),
+  TRANSLATE_NOOP("GameDatabase", "Force Recompiler Memory Exceptions"),
+  TRANSLATE_NOOP("GameDatabase", "Force Recompiler ICache"),
+  TRANSLATE_NOOP("GameDatabase", "Force Recompiler LUT Fastmem"),
+  TRANSLATE_NOOP("GameDatabase", "Is LibCrypt Protected"),
 }};
 
 static constexpr const char* GAMEDB_YAML_FILENAME = "gamedb.yaml";
 static constexpr const char* DISCDB_YAML_FILENAME = "discdb.yaml";
-static DisplayDeinterlacingMode DEFAULT_DEINTERLACING_MODE = DisplayDeinterlacingMode::Adaptive;
 
 static bool s_loaded = false;
 static bool s_track_hashes_loaded = false;
 
-static DynamicHeapArray<u8> s_db_data; // we take strings from the data, so store a copy
 static std::vector<GameDatabase::Entry> s_entries;
 static PreferUnorderedStringMap<u32> s_code_lookup;
 
 static TrackHashesMap s_track_hashes_map;
 } // namespace GameDatabase
+
+// RapidYAML utility routines.
+
+ALWAYS_INLINE std::string_view to_stringview(const c4::csubstr& s)
+{
+  return std::string_view(s.data(), s.size());
+}
+
+ALWAYS_INLINE std::string_view to_stringview(const c4::substr& s)
+{
+  return std::string_view(s.data(), s.size());
+}
+
+ALWAYS_INLINE c4::csubstr to_csubstr(std::string_view sv)
+{
+  return c4::csubstr(sv.data(), sv.length());
+}
+
+static bool GetStringFromObject(const ryml::ConstNodeRef& object, std::string_view key, std::string* dest)
+{
+  dest->clear();
+
+  const ryml::ConstNodeRef member = object.find_child(to_csubstr(key));
+  if (!member.valid())
+    return false;
+
+  const c4::csubstr val = member.val();
+  if (!val.empty())
+    dest->assign(val.data(), val.size());
+
+  return true;
+}
+
+template<typename T>
+static bool GetUIntFromObject(const ryml::ConstNodeRef& object, std::string_view key, T* dest)
+{
+  *dest = 0;
+
+  const ryml::ConstNodeRef member = object.find_child(to_csubstr(key));
+  if (!member.valid())
+    return false;
+
+  const c4::csubstr val = member.val();
+  if (val.empty())
+  {
+    ERROR_LOG("Unexpected empty value in {}", key);
+    return false;
+  }
+
+  const std::optional<T> opt_value = StringUtil::FromChars<T>(to_stringview(val));
+  if (!opt_value.has_value())
+  {
+    ERROR_LOG("Unexpected non-uint value in {}", key);
+    return false;
+  }
+
+  *dest = opt_value.value();
+  return true;
+}
+
+template<typename T>
+static std::optional<T> GetOptionalTFromObject(const ryml::ConstNodeRef& object, std::string_view key)
+{
+  std::optional<T> ret;
+
+  const ryml::ConstNodeRef member = object.find_child(to_csubstr(key));
+  if (member.valid())
+  {
+    const c4::csubstr val = member.val();
+    if (!val.empty())
+    {
+      ret = StringUtil::FromChars<T>(to_stringview(val));
+      if (!ret.has_value())
+      {
+        if constexpr (std::is_floating_point_v<T>)
+          ERROR_LOG("Unexpected non-float value in {}", key);
+        else if constexpr (std::is_integral_v<T>)
+          ERROR_LOG("Unexpected non-int value in {}", key);
+      }
+    }
+    else
+    {
+      ERROR_LOG("Unexpected empty value in {}", key);
+    }
+  }
+
+  return ret;
+}
+
+template<typename T>
+static std::optional<T> ParseOptionalTFromObject(const ryml::ConstNodeRef& object, std::string_view key,
+                                                 std::optional<T> (*from_string_function)(const char* str))
+{
+  std::optional<T> ret;
+
+  const ryml::ConstNodeRef member = object.find_child(to_csubstr(key));
+  if (member.valid())
+  {
+    const c4::csubstr val = member.val();
+    if (!val.empty())
+    {
+      ret = from_string_function(TinyString(to_stringview(val)));
+      if (!ret.has_value())
+        ERROR_LOG("Unknown value for {}: {}", key, to_stringview(val));
+    }
+    else
+    {
+      ERROR_LOG("Unexpected empty value in {}", key);
+    }
+  }
+
+  return ret;
+}
 
 void GameDatabase::EnsureLoaded()
 {
@@ -169,15 +261,8 @@ void GameDatabase::EnsureLoaded()
     s_entries = {};
     s_code_lookup = {};
 
-    if (LoadGameDBYaml())
-    {
-      SaveToCache();
-    }
-    else
-    {
-      s_entries = {};
-      s_code_lookup = {};
-    }
+    LoadGameDBYaml();
+    SaveToCache();
   }
 
   INFO_LOG("Database load of {} entries took {:.0f}ms.", s_entries.size(), timer.GetTimeMilliseconds());
@@ -229,7 +314,7 @@ std::string GameDatabase::GetSerialForPath(const char* path)
 const GameDatabase::Entry* GameDatabase::GetEntryForDisc(CDImage* image)
 {
   std::string id;
-  GameHash hash;
+  System::GameHash hash;
   System::GetGameDetailsFromImage(image, &id, &hash);
   const Entry* entry = GetEntryForGameDetails(id, hash);
   if (entry)
@@ -260,15 +345,20 @@ const GameDatabase::Entry* GameDatabase::GetEntryForGameDetails(const std::strin
 
 const GameDatabase::Entry* GameDatabase::GetEntryForSerial(std::string_view serial)
 {
-  if (serial.empty())
-    return nullptr;
-
   EnsureLoaded();
 
-  const auto it =
-    std::lower_bound(s_entries.cbegin(), s_entries.cend(), serial,
-                     [](const Entry& entry, const std::string_view& search) { return (entry.serial < search); });
-  return (it != s_entries.end() && it->serial == serial) ? &(*it) : nullptr;
+  return GetMutableEntry(serial);
+}
+
+GameDatabase::Entry* GameDatabase::GetMutableEntry(std::string_view serial)
+{
+  for (Entry& entry : s_entries)
+  {
+    if (entry.serial == serial)
+      return &entry;
+  }
+
+  return nullptr;
 }
 
 const char* GameDatabase::GetTraitName(Trait trait)
@@ -291,42 +381,6 @@ const char* GameDatabase::GetCompatibilityRatingDisplayName(CompatibilityRating 
   return (rating >= CompatibilityRating::Unknown && rating < CompatibilityRating::Count) ?
            Host::TranslateToCString("GameDatabase", s_compatibility_rating_display_names[static_cast<size_t>(rating)]) :
            "";
-}
-
-const char* GameDatabase::GetLanguageName(Language language)
-{
-  return s_language_names[static_cast<size_t>(language)];
-}
-
-std::optional<GameDatabase::Language> GameDatabase::ParseLanguageName(std::string_view str)
-{
-  for (size_t i = 0; i < static_cast<size_t>(Language::MaxCount); i++)
-  {
-    if (str == s_language_names[i])
-      return static_cast<Language>(i);
-  }
-
-  return std::nullopt;
-}
-
-SmallString GameDatabase::Entry::GetLanguagesString() const
-{
-  SmallString ret;
-
-  bool first = true;
-  for (u32 i = 0; i < static_cast<u32>(Language::MaxCount); i++)
-  {
-    if (languages.test(i))
-    {
-      ret.append_format("{}{}", first ? "" : ", ", GetLanguageName(static_cast<Language>(i)));
-      first = false;
-    }
-  }
-
-  if (ret.empty())
-    ret.append(TRANSLATE_SV("GameDatabase", "Unknown"));
-
-  return ret;
 }
 
 void GameDatabase::Entry::ApplySettings(Settings& settings, bool display_osd_messages) const
@@ -426,6 +480,17 @@ void GameDatabase::Entry::ApplySettings(Settings& settings, bool display_osd_mes
     settings.display_crop_mode = display_crop_mode.value();
   }
 
+  if (display_deinterlacing_mode.has_value())
+  {
+    if (display_osd_messages && settings.display_deinterlacing_mode != display_deinterlacing_mode.value())
+    {
+      APPEND_MESSAGE_FMT(TRANSLATE_FS("GameDatabase", "Deinterlacing set to {}."),
+                         Settings::GetDisplayDeinterlacingModeDisplayName(display_deinterlacing_mode.value()));
+    }
+
+    settings.display_deinterlacing_mode = display_deinterlacing_mode.value();
+  }
+
   if (HasTrait(Trait::ForceInterpreter))
   {
     if (display_osd_messages && settings.cpu_execution_mode != CPUExecutionMode::Interpreter)
@@ -463,30 +528,12 @@ void GameDatabase::Entry::ApplySettings(Settings& settings, bool display_osd_mes
     settings.gpu_accurate_blending = true;
   }
 
-  if (HasTrait(Trait::ForceDeinterlacing))
+  if (HasTrait(Trait::ForceInterlacing))
   {
-    const DisplayDeinterlacingMode new_mode = display_deinterlacing_mode.value_or(DEFAULT_DEINTERLACING_MODE);
-    if (display_osd_messages && settings.display_deinterlacing_mode != new_mode)
-    {
-      APPEND_MESSAGE_FMT(TRANSLATE_FS("GameDatabase", "Deinterlacing set to {}."),
-                         Settings::GetDisplayDeinterlacingModeDisplayName(display_deinterlacing_mode.value()));
-    }
+    if (display_osd_messages && settings.gpu_disable_interlacing)
+      APPEND_MESSAGE(TRANSLATE_SV("GameDatabase", "Interlaced rendering enabled."));
 
-    settings.display_deinterlacing_mode = new_mode;
-  }
-  else if (display_deinterlacing_mode.has_value())
-  {
-    // If the user has it set to progressive, then preserve that.
-    if (settings.display_deinterlacing_mode != DisplayDeinterlacingMode::Progressive)
-    {
-      if (display_osd_messages && settings.display_deinterlacing_mode != display_deinterlacing_mode.value())
-      {
-        APPEND_MESSAGE_FMT(TRANSLATE_FS("GameDatabase", "Deinterlacing set to {}."),
-                           Settings::GetDisplayDeinterlacingModeDisplayName(display_deinterlacing_mode.value()));
-      }
-
-      settings.display_deinterlacing_mode = display_deinterlacing_mode.value();
-    }
+    settings.gpu_disable_interlacing = false;
   }
 
   if (HasTrait(Trait::DisableTrueColor))
@@ -543,6 +590,14 @@ void GameDatabase::Entry::ApplySettings(Settings& settings, bool display_osd_mes
     settings.gpu_widescreen_hack = false;
   }
 
+  if (HasTrait(Trait::DisableForceNTSCTimings))
+  {
+    if (display_osd_messages && settings.gpu_force_ntsc_timings)
+      APPEND_MESSAGE(TRANSLATE_SV("GameDatabase", "Force NTSC timings disabled."));
+
+    settings.gpu_force_ntsc_timings = false;
+  }
+
   if (HasTrait(Trait::DisablePGXP))
   {
     if (display_osd_messages && settings.gpu_pgxp_enable)
@@ -595,7 +650,7 @@ void GameDatabase::Entry::ApplySettings(Settings& settings, bool display_osd_mes
   }
   else if (settings.gpu_pgxp_enable && settings.gpu_pgxp_vertex_cache)
   {
-    Host::AddIconOSDWarning(
+    Host::AddIconOSDMessage(
       "gamedb_force_pgxp_vertex_cache", ICON_EMOJI_WARNING,
       TRANSLATE_STR(
         "GameDatabase",
@@ -610,7 +665,7 @@ void GameDatabase::Entry::ApplySettings(Settings& settings, bool display_osd_mes
 #ifndef __ANDROID__
       APPEND_MESSAGE(TRANSLATE_SV("GameDatabase", "PGXP CPU mode enabled."));
 #else
-      Host::AddIconOSDWarning("gamedb_force_pgxp_cpu", ICON_EMOJI_WARNING,
+      Host::AddIconOSDMessage("gamedb_force_pgxp_cpu", ICON_EMOJI_WARNING,
                               "This game requires PGXP CPU mode, which increases system requirements.\n"
                               "      If the game runs too slow, disable PGXP for this game.",
                               Host::OSD_WARNING_DURATION);
@@ -621,7 +676,7 @@ void GameDatabase::Entry::ApplySettings(Settings& settings, bool display_osd_mes
   }
   else if (settings.UsingPGXPCPUMode())
   {
-    Host::AddIconOSDWarning(
+    Host::AddIconOSDMessage(
       "gamedb_force_pgxp_cpu", ICON_EMOJI_WARNING,
       TRANSLATE_STR("GameDatabase",
                     "PGXP CPU mode is enabled, but it is not required for this game. This may cause rendering errors."),
@@ -660,12 +715,6 @@ void GameDatabase::Entry::ApplySettings(Settings& settings, bool display_osd_mes
   {
     WARNING_LOG("LUT fastmem for recompiler forced by compatibility settings.");
     settings.cpu_fastmem_mode = CPUFastmemMode::LUT;
-  }
-
-  if (HasTrait(Trait::ForceCDROMSubQSkew))
-  {
-    WARNING_LOG("CD-ROM SubQ Skew forced by compatibility settings.");
-    settings.cdrom_subq_skew = true;
   }
 
   if (!messages.empty())
@@ -782,10 +831,6 @@ std::string GameDatabase::Entry::GenerateCompatibilityReport() const
   LargeString ret;
   ret.append_format("**{}:** {}\n\n", TRANSLATE_SV("GameDatabase", "Title"), title);
   ret.append_format("**{}:** {}\n\n", TRANSLATE_SV("GameDatabase", "Serial"), serial);
-
-  if (languages.any())
-    ret.append_format("**{}:** {}\n\n", TRANSLATE_SV("GameDatabase", "Languages"), GetLanguagesString());
-
   ret.append_format("**{}:** {}\n\n", TRANSLATE_SV("GameDatabase", "Rating"),
                     GetCompatibilityRatingDisplayName(compatibility));
 
@@ -813,7 +858,7 @@ std::string GameDatabase::Entry::GenerateCompatibilityReport() const
   if (traits.any())
   {
     ret.append_format("**{}**\n\n", TRANSLATE_SV("GameDatabase", "Traits"));
-    for (u32 i = 0; i < static_cast<u32>(Trait::MaxCount); i++)
+    for (u32 i = 0; i < static_cast<u32>(Trait::Count); i++)
     {
       if (traits.test(i))
         ret.append_format(" - {}\n", GetTraitDisplayName(static_cast<Trait>(i)));
@@ -861,15 +906,14 @@ static std::string GetCacheFile()
 
 bool GameDatabase::LoadFromCache()
 {
-  Error error;
-  std::optional<DynamicHeapArray<u8>> db_data = FileSystem::ReadBinaryFile(GetCacheFile().c_str(), &error);
-  if (!db_data.has_value())
+  auto fp = FileSystem::OpenManagedCFile(GetCacheFile().c_str(), "rb");
+  if (!fp)
   {
-    DEV_LOG("Failed to read cache, loading full database: {}", error.GetDescription());
+    DEV_LOG("Cache does not exist, loading full database.");
     return false;
   }
 
-  BinarySpanReader reader(db_data->cspan());
+  BinaryFileReader reader(fp.get());
   const u64 gamedb_ts = Host::GetResourceFileTimestamp("gamedb.yaml", false).value_or(0);
 
   u32 signature, version, num_entries, num_codes;
@@ -894,10 +938,8 @@ bool GameDatabase::LoadFromCache()
   {
     Entry& entry = s_entries.emplace_back();
 
-    constexpr u32 trait_num_bytes = (static_cast<u32>(Trait::MaxCount) + 7) / 8;
-    constexpr u32 language_num_bytes = (static_cast<u32>(Language::MaxCount) + 7) / 8;
-    std::array<u8, trait_num_bytes> trait_bits;
-    std::array<u8, language_num_bytes> language_bits;
+    constexpr u32 num_bytes = (static_cast<u32>(Trait::Count) + 7) / 8;
+    std::array<u8, num_bytes> bits;
     u8 compatibility;
     u32 num_disc_set_serials;
 
@@ -909,8 +951,7 @@ bool GameDatabase::LoadFromCache()
         !reader.ReadU8(&entry.min_players) || !reader.ReadU8(&entry.max_players) || !reader.ReadU8(&entry.min_blocks) ||
         !reader.ReadU8(&entry.max_blocks) || !reader.ReadU16(&entry.supported_controllers) ||
         !reader.ReadU8(&compatibility) || compatibility >= static_cast<u8>(GameDatabase::CompatibilityRating::Count) ||
-        !reader.Read(trait_bits.data(), trait_num_bytes) || !reader.Read(language_bits.data(), language_num_bytes) ||
-        !reader.ReadOptionalT(&entry.display_active_start_offset) ||
+        !reader.Read(bits.data(), num_bytes) || !reader.ReadOptionalT(&entry.display_active_start_offset) ||
         !reader.ReadOptionalT(&entry.display_active_end_offset) ||
         !reader.ReadOptionalT(&entry.display_line_start_offset) ||
         !reader.ReadOptionalT(&entry.display_line_end_offset) || !reader.ReadOptionalT(&entry.display_crop_mode) ||
@@ -939,15 +980,10 @@ bool GameDatabase::LoadFromCache()
 
     entry.compatibility = static_cast<GameDatabase::CompatibilityRating>(compatibility);
     entry.traits.reset();
-    for (size_t j = 0; j < static_cast<size_t>(Trait::MaxCount); j++)
+    for (u32 j = 0; j < static_cast<int>(Trait::Count); j++)
     {
-      if ((trait_bits[j / 8] & (1u << (j % 8))) != 0)
+      if ((bits[j / 8] & (1u << (j % 8))) != 0)
         entry.traits[j] = true;
-    }
-    for (size_t j = 0; j < static_cast<size_t>(Language::MaxCount); j++)
-    {
-      if ((language_bits[j / 8] & (1u << (j % 8))) != 0)
-        entry.languages[j] = true;
     }
   }
 
@@ -964,7 +1000,6 @@ bool GameDatabase::LoadFromCache()
     s_code_lookup.emplace(std::move(code), index);
   }
 
-  s_db_data = std::move(db_data.value());
   return true;
 }
 
@@ -973,7 +1008,7 @@ bool GameDatabase::SaveToCache()
   const u64 gamedb_ts = Host::GetResourceFileTimestamp("gamedb.yaml", false).value_or(0);
 
   Error error;
-  FileSystem::AtomicRenamedFile file = FileSystem::CreateAtomicRenamedFile(GetCacheFile(), &error);
+  FileSystem::AtomicRenamedFile file = FileSystem::CreateAtomicRenamedFile(GetCacheFile(), "wb", &error);
   if (!file)
   {
     ERROR_LOG("Failed to open cache file for writing: {}", error.GetDescription());
@@ -1005,24 +1040,16 @@ bool GameDatabase::SaveToCache()
     writer.WriteU16(entry.supported_controllers);
     writer.WriteU8(static_cast<u8>(entry.compatibility));
 
-    constexpr u32 trait_num_bytes = (static_cast<u32>(Trait::MaxCount) + 7) / 8;
-    std::array<u8, trait_num_bytes> trait_bits = {};
-    for (size_t j = 0; j < static_cast<size_t>(Trait::MaxCount); j++)
+    constexpr u32 num_bytes = (static_cast<u32>(Trait::Count) + 7) / 8;
+    std::array<u8, num_bytes> bits;
+    bits.fill(0);
+    for (u32 j = 0; j < static_cast<int>(Trait::Count); j++)
     {
       if (entry.traits[j])
-        trait_bits[j / 8] |= (1u << (j % 8));
+        bits[j / 8] |= (1u << (j % 8));
     }
 
-    writer.Write(trait_bits.data(), trait_num_bytes);
-
-    constexpr u32 language_num_bytes = (static_cast<u32>(Language::MaxCount) + 7) / 8;
-    std::array<u8, language_num_bytes> language_bits = {};
-    for (size_t j = 0; j < static_cast<size_t>(Language::MaxCount); j++)
-    {
-      if (entry.languages[j])
-        language_bits[j / 8] |= (1u << (j % 8));
-    }
-    writer.Write(language_bits.data(), language_num_bytes);
+    writer.Write(bits.data(), num_bytes);
 
     writer.WriteOptionalT(entry.display_active_start_offset);
     writer.WriteOptionalT(entry.display_active_end_offset);
@@ -1066,7 +1093,7 @@ void GameDatabase::SetRymlCallbacks()
 
 bool GameDatabase::LoadGameDBYaml()
 {
-  std::optional<DynamicHeapArray<u8>> gamedb_data = Host::ReadResourceFile(GAMEDB_YAML_FILENAME, false);
+  const std::optional<std::string> gamedb_data = Host::ReadResourceFileToString(GAMEDB_YAML_FILENAME, false);
   if (!gamedb_data.has_value())
   {
     ERROR_LOG("Failed to read game database");
@@ -1075,67 +1102,37 @@ bool GameDatabase::LoadGameDBYaml()
 
   SetRymlCallbacks();
 
-  const ryml::Tree tree = ryml::parse_in_place(
-    to_csubstr(GAMEDB_YAML_FILENAME), c4::substr(reinterpret_cast<char*>(gamedb_data->data()), gamedb_data->size()));
+  const ryml::Tree tree = ryml::parse_in_arena(to_csubstr(GAMEDB_YAML_FILENAME), to_csubstr(gamedb_data.value()));
   const ryml::ConstNodeRef root = tree.rootref();
   s_entries.reserve(root.num_children());
 
-  PreferUnorderedStringMap<std::string_view> code_lookup;
-
-  for (const ryml::ConstNodeRef& current : root.cchildren())
+  for (const ryml::ConstNodeRef& current : root.children())
   {
-    const std::string_view serial = to_stringview(current.key());
-    if (current.empty())
-    {
-      ERROR_LOG("Missing serial for entry.");
-      return false;
-    }
-
+    // TODO: binary sort
+    const u32 index = static_cast<u32>(s_entries.size());
     Entry& entry = s_entries.emplace_back();
-    entry.serial = serial;
     if (!ParseYamlEntry(&entry, current))
     {
       s_entries.pop_back();
       continue;
     }
 
-    ParseYamlCodes(code_lookup, current, serial);
+    ParseYamlCodes(index, current, entry.serial);
   }
-
-  // Sorting must be done before generating code lookup, because otherwise the indices won't match.
-  s_entries.shrink_to_fit();
-  std::sort(s_entries.begin(), s_entries.end(),
-            [](const Entry& lhs, const Entry& rhs) { return (lhs.serial < rhs.serial); });
 
   ryml::reset_callbacks();
-
-  for (const auto& [code, serial] : code_lookup)
-  {
-    const auto it =
-      std::lower_bound(s_entries.cbegin(), s_entries.cend(), serial,
-                       [](const Entry& entry, const std::string_view& search) { return (entry.serial < search); });
-    if (it == s_entries.end() || it->serial != serial)
-    {
-      ERROR_LOG("Somehow we messed up our code lookup for {} and {}?!", code, serial);
-      continue;
-    }
-
-    if (!s_code_lookup.emplace(code, static_cast<u32>(std::distance(s_entries.cbegin(), it))).second)
-      ERROR_LOG("Failed to insert code {}", code);
-  }
-
-  if (s_entries.empty())
-  {
-    ERROR_LOG("Game database is empty.");
-    return false;
-  }
-
-  s_db_data = std::move(gamedb_data.value());
-  return true;
+  return !s_entries.empty();
 }
 
 bool GameDatabase::ParseYamlEntry(Entry* entry, const ryml::ConstNodeRef& value)
 {
+  entry->serial = to_stringview(value.key());
+  if (entry->serial.empty())
+  {
+    ERROR_LOG("Missing serial for entry.");
+    return false;
+  }
+
   GetStringFromObject(value, "name", &entry->title);
 
   if (const ryml::ConstNodeRef metadata = value.find_child(to_csubstr("metadata")); metadata.valid())
@@ -1148,18 +1145,6 @@ bool GameDatabase::ParseYamlEntry(Entry* entry, const ryml::ConstNodeRef& value)
     GetUIntFromObject(metadata, "maxPlayers", &entry->max_players);
     GetUIntFromObject(metadata, "minBlocks", &entry->min_blocks);
     GetUIntFromObject(metadata, "maxBlocks", &entry->max_blocks);
-
-    if (const ryml::ConstNodeRef languages = metadata.find_child(to_csubstr("languages")); languages.valid())
-    {
-      for (const ryml::ConstNodeRef language : languages.cchildren())
-      {
-        const std::string_view vlanguage = to_stringview(language.val());
-        if (const std::optional<Language> planguage = ParseLanguageName(vlanguage); planguage.has_value())
-          entry->languages[static_cast<size_t>(planguage.value())] = true;
-        else
-          WARNING_LOG("Unknown language {} in {}.", vlanguage, entry->serial);
-      }
-    }
 
     entry->release_date = 0;
     {
@@ -1188,7 +1173,7 @@ bool GameDatabase::ParseYamlEntry(Entry* entry, const ryml::ConstNodeRef& value)
       controllers.valid() && controllers.has_children())
   {
     bool first = true;
-    for (const ryml::ConstNodeRef& controller : controllers.cchildren())
+    for (const ryml::ConstNodeRef& controller : controllers.children())
     {
       const std::string_view controller_str = to_stringview(controller.val());
       if (controller_str.empty())
@@ -1241,7 +1226,7 @@ bool GameDatabase::ParseYamlEntry(Entry* entry, const ryml::ConstNodeRef& value)
 
   if (const ryml::ConstNodeRef traits = value.find_child(to_csubstr("traits")); traits.valid() && traits.has_children())
   {
-    for (const ryml::ConstNodeRef& trait : traits.cchildren())
+    for (const ryml::ConstNodeRef& trait : traits.children())
     {
       const std::string_view trait_str = to_stringview(trait.val());
       if (trait_str.empty())
@@ -1258,7 +1243,7 @@ bool GameDatabase::ParseYamlEntry(Entry* entry, const ryml::ConstNodeRef& value)
       }
 
       const size_t trait_idx = static_cast<size_t>(std::distance(s_trait_names.begin(), iter));
-      DebugAssert(trait_idx < static_cast<size_t>(Trait::MaxCount));
+      DebugAssert(trait_idx < static_cast<size_t>(Trait::Count));
       entry->traits[trait_idx] = true;
     }
   }
@@ -1329,21 +1314,20 @@ bool GameDatabase::ParseYamlEntry(Entry* entry, const ryml::ConstNodeRef& value)
   return true;
 }
 
-bool GameDatabase::ParseYamlCodes(PreferUnorderedStringMap<std::string_view>& lookup, const ryml::ConstNodeRef& value,
-                                  std::string_view serial)
+bool GameDatabase::ParseYamlCodes(u32 index, const ryml::ConstNodeRef& value, std::string_view serial)
 {
   const ryml::ConstNodeRef& codes = value.find_child(to_csubstr("codes"));
   if (!codes.valid() || !codes.has_children())
   {
     // use serial instead
-    auto iter = lookup.find(serial);
-    if (iter != lookup.end())
+    auto iter = s_code_lookup.find(serial);
+    if (iter != s_code_lookup.end())
     {
       WARNING_LOG("Duplicate code '{}'", serial);
       return false;
     }
 
-    lookup.emplace(serial, serial);
+    s_code_lookup.emplace(serial, index);
     return true;
   }
 
@@ -1357,14 +1341,14 @@ bool GameDatabase::ParseYamlCodes(PreferUnorderedStringMap<std::string_view>& lo
       continue;
     }
 
-    auto iter = lookup.find(current_code_str);
-    if (iter != lookup.end())
+    auto iter = s_code_lookup.find(current_code_str);
+    if (iter != s_code_lookup.end())
     {
       WARNING_LOG("Duplicate code '{}' in {}", current_code_str, serial);
       continue;
     }
 
-    lookup.emplace(current_code_str, serial);
+    s_code_lookup.emplace(current_code_str, index);
     added++;
   }
 
@@ -1400,7 +1384,7 @@ bool GameDatabase::LoadTrackHashes()
   s_track_hashes_map = {};
 
   size_t serials = 0;
-  for (const ryml::ConstNodeRef& current : root.cchildren())
+  for (const ryml::ConstNodeRef& current : root.children())
   {
     const std::string_view serial = to_stringview(current.key());
     if (serial.empty() || !current.has_children())
@@ -1417,7 +1401,7 @@ bool GameDatabase::LoadTrackHashes()
     }
 
     u32 revision = 0;
-    for (const ryml::ConstNodeRef& track_revisions : track_data.cchildren())
+    for (const ryml::ConstNodeRef& track_revisions : track_data.children())
     {
       const ryml::ConstNodeRef tracks = track_revisions.find_child(to_csubstr("tracks"));
       if (!tracks.valid() || !tracks.has_children())
