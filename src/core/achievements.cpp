@@ -2491,6 +2491,7 @@ void Achievements::DrawAchievementsWindow()
 
     ImGuiFullscreen::ResetFocusHere();
     ImGuiFullscreen::BeginMenuButtons();
+    ImGuiFullscreen::ResetFocusHere();
 
     for (u32 bucket_type : {RC_CLIENT_ACHIEVEMENT_BUCKET_ACTIVE_CHALLENGE,
                             RC_CLIENT_ACHIEVEMENT_BUCKET_RECENTLY_UNLOCKED, RC_CLIENT_ACHIEVEMENT_BUCKET_UNLOCKED,
@@ -2954,6 +2955,10 @@ void Achievements::DrawLeaderboardsWindow()
   if (ImGuiFullscreen::IsFocusResetFromWindowChange())
     ImGui::SetNextWindowScroll(ImVec2(0.0f, 0.0f));
 
+  // See note in FullscreenUI::DrawSettingsWindow().
+  if (ImGuiFullscreen::IsFocusResetFromWindowChange())
+    ImGui::SetNextWindowScroll(ImVec2(0.0f, 0.0f));
+
   if (!is_leaderboard_open)
   {
     if (ImGuiFullscreen::BeginFullscreenWindow(
@@ -2963,6 +2968,7 @@ void Achievements::DrawLeaderboardsWindow()
     {
       ImGuiFullscreen::ResetFocusHere();
       ImGuiFullscreen::BeginMenuButtons();
+      ImGuiFullscreen::ResetFocusHere();
 
       for (u32 bucket_index = 0; bucket_index < s_leaderboard_list->num_buckets; bucket_index++)
       {
@@ -3004,6 +3010,8 @@ void Achievements::DrawLeaderboardsWindow()
       {
         if (s_leaderboard_nearby_entries)
         {
+          ImGuiFullscreen::ResetFocusHere();
+
           for (u32 i = 0; i < s_leaderboard_nearby_entries->num_entries; i++)
           {
             DrawLeaderboardEntry(s_leaderboard_nearby_entries->entries[i],
@@ -3026,6 +3034,9 @@ void Achievements::DrawLeaderboardsWindow()
       }
       else
       {
+        if (ImGuiFullscreen::IsFocusResetFromWindowChange() && !s_leaderboard_entry_lists.empty())
+          ImGuiFullscreen::ResetFocusHere();
+
         for (const rc_client_leaderboard_entry_list_t* list : s_leaderboard_entry_lists)
         {
           for (u32 i = 0; i < list->num_entries; i++)
