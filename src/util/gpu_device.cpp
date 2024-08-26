@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
 
 #include "gpu_device.h"
 #include "compress_helpers.h"
+#include "core/host.h"     // TODO: Remove, needed for getting fullscreen mode.
+#include "core/settings.h" // TODO: Remove, needed for dump directory.
 #include "gpu_framebuffer_manager.h"
-#include "image.h"
 #include "shadergen.h"
 
 #include "common/assert.h"
@@ -21,10 +22,10 @@
 #include "fmt/format.h"
 #include "imgui.h"
 #include "shaderc/shaderc.h"
-#include "spirv_cross_c.h"
+#include "spirv_cross/spirv_cross_c.h"
 #include "xxhash.h"
 
-LOG_CHANNEL(GPUDevice);
+Log_SetChannel(GPUDevice);
 
 #ifdef _WIN32
 #include "common/windows_headers.h"
@@ -43,7 +44,6 @@ LOG_CHANNEL(GPUDevice);
 
 std::unique_ptr<GPUDevice> g_gpu_device;
 
-static std::string s_shader_dump_path;
 static std::string s_pipeline_cache_path;
 static size_t s_pipeline_cache_size;
 static std::array<u8, SHA1Digest::DIGEST_SIZE> s_pipeline_cache_hash;
@@ -226,49 +226,6 @@ size_t GPUFramebufferManagerBase::KeyHash::operator()(const Key& key) const
     return XXH32(&key, sizeof(key), 0x1337);
 }
 
-GPUSwapChain::GPUSwapChain(const WindowInfo& wi, GPUVSyncMode vsync_mode, bool allow_present_throttle)
-  : m_window_info(wi), m_vsync_mode(vsync_mode), m_allow_present_throttle(allow_present_throttle)
-{
-}
-
-GPUSwapChain::~GPUSwapChain() = default;
-
-bool GPUSwapChain::ShouldSkipPresentingFrame()
-{
-  // Only needed with FIFO. But since we're so fast, we allow it always.
-  if (!m_allow_present_throttle)
-    return false;
-
-  const float throttle_rate = (m_window_info.surface_refresh_rate > 0.0f) ? m_window_info.surface_refresh_rate : 60.0f;
-  const float throttle_period = 1.0f / throttle_rate;
-
-  const u64 now = Timer::GetCurrentValue();
-  const double diff = Timer::ConvertValueToSeconds(now - m_last_frame_displayed_time);
-  if (diff < throttle_period)
-    return true;
-
-  m_last_frame_displayed_time = now;
-  return false;
-}
-
-void GPUSwapChain::ThrottlePresentation()
-{
-  const float throttle_rate = (m_window_info.surface_refresh_rate > 0.0f) ? m_window_info.surface_refresh_rate : 60.0f;
-
-  const u64 sleep_period = Timer::ConvertNanosecondsToValue(1e+9f / static_cast<double>(throttle_rate));
-  const u64 current_ts = Timer::GetCurrentValue();
-
-  // Allow it to fall behind/run ahead up to 2*period. Sleep isn't that precise, plus we need to
-  // allow time for the actual rendering.
-  const u64 max_variance = sleep_period * 2;
-  if (static_cast<u64>(std::abs(static_cast<s64>(current_ts - m_last_frame_displayed_time))) > max_variance)
-    m_last_frame_displayed_time = current_ts + sleep_period;
-  else
-    m_last_frame_displayed_time += sleep_period;
-
-  Timer::SleepUntil(m_last_frame_displayed_time, false);
-}
-
 GPUDevice::GPUDevice()
 {
   ResetStatistics();
@@ -389,25 +346,27 @@ GPUDevice::AdapterInfoList GPUDevice::GetAdapterListForAPI(RenderAPI api)
   return ret;
 }
 
-bool GPUDevice::Create(std::string_view adapter, FeatureMask disabled_features, std::string_view shader_dump_path,
-                       std::string_view shader_cache_path, u32 shader_cache_version, bool debug_device,
-                       const WindowInfo& wi, GPUVSyncMode vsync, bool allow_present_throttle,
-                       const ExclusiveFullscreenMode* exclusive_fullscreen_mode,
-                       std::optional<bool> exclusive_fullscreen_control, Error* error)
+bool GPUDevice::Create(std::string_view adapter, std::string_view shader_cache_path, u32 shader_cache_version,
+                       bool debug_device, GPUVSyncMode vsync, bool allow_present_throttle, bool threaded_presentation,
+                       std::optional<bool> exclusive_fullscreen_control, FeatureMask disabled_features, Error* error)
 {
+  m_vsync_mode = vsync;
+  m_allow_present_throttle = allow_present_throttle;
   m_debug_device = debug_device;
-  s_shader_dump_path = shader_dump_path;
 
-  INFO_LOG("Main render window is {}x{}.", wi.surface_width, wi.surface_height);
-  if (!CreateDeviceAndMainSwapChain(adapter, disabled_features, wi, vsync, allow_present_throttle,
-                                    exclusive_fullscreen_mode, exclusive_fullscreen_control, error))
+  if (!AcquireWindow(true))
+  {
+    Error::SetStringView(error, "Failed to acquire window from host.");
+    return false;
+  }
+
+  if (!CreateDevice(adapter, threaded_presentation, exclusive_fullscreen_control, disabled_features, error))
   {
     if (error && !error->IsValid())
       error->SetStringView("Failed to create device.");
     return false;
   }
 
-  INFO_LOG("Render API: {} Version {}", RenderAPIToString(m_render_api), m_render_api_version);
   INFO_LOG("Graphics Driver Info:\n{}", GetDriverInfo());
 
   OpenShaderCache(shader_cache_path, shader_cache_version);
@@ -423,28 +382,12 @@ bool GPUDevice::Create(std::string_view adapter, FeatureMask disabled_features, 
 
 void GPUDevice::Destroy()
 {
-  s_shader_dump_path = {};
-
   PurgeTexturePool();
+  if (HasSurface())
+    DestroySurface();
   DestroyResources();
   CloseShaderCache();
   DestroyDevice();
-}
-
-bool GPUDevice::RecreateMainSwapChain(const WindowInfo& wi, GPUVSyncMode vsync_mode, bool allow_present_throttle,
-                                      const ExclusiveFullscreenMode* exclusive_fullscreen_mode,
-                                      std::optional<bool> exclusive_fullscreen_control, Error* error)
-{
-
-  m_main_swap_chain.reset();
-  m_main_swap_chain = CreateSwapChain(wi, vsync_mode, allow_present_throttle, exclusive_fullscreen_mode,
-                                      exclusive_fullscreen_control, error);
-  return static_cast<bool>(m_main_swap_chain);
-}
-
-void GPUDevice::DestroyMainSwapChain()
-{
-  m_main_swap_chain.reset();
 }
 
 bool GPUDevice::SupportsExclusiveFullscreen() const
@@ -458,7 +401,7 @@ void GPUDevice::OpenShaderCache(std::string_view base_path, u32 version)
   {
     const std::string basename = GetShaderCacheBaseName("shaders");
     const std::string filename = Path::Combine(base_path, basename);
-    if (!m_shader_cache.Open(filename.c_str(), m_render_api_version, version))
+    if (!m_shader_cache.Open(filename.c_str(), version))
     {
       WARNING_LOG("Failed to open shader cache. Creating new cache.");
       if (!m_shader_cache.Create())
@@ -480,33 +423,18 @@ void GPUDevice::OpenShaderCache(std::string_view base_path, u32 version)
   else
   {
     // Still need to set the version - GL needs it.
-    m_shader_cache.Open(std::string_view(), m_render_api_version, version);
+    m_shader_cache.Open(std::string_view(), version);
   }
 
   s_pipeline_cache_path = {};
-  s_pipeline_cache_size = 0;
-  s_pipeline_cache_hash = {};
-
   if (m_features.pipeline_cache && !base_path.empty())
   {
-    Error error;
-    s_pipeline_cache_path =
-      Path::Combine(base_path, TinyString::from_format("{}.bin", GetShaderCacheBaseName("pipelines")));
-    if (FileSystem::FileExists(s_pipeline_cache_path.c_str()))
-    {
-      if (OpenPipelineCache(s_pipeline_cache_path, &error))
-        return;
-
-      WARNING_LOG("Failed to read pipeline cache '{}': {}", Path::GetFileName(s_pipeline_cache_path),
-                  error.GetDescription());
-    }
-
-    if (!CreatePipelineCache(s_pipeline_cache_path, &error))
-    {
-      WARNING_LOG("Failed to create pipeline cache '{}': {}", Path::GetFileName(s_pipeline_cache_path),
-                  error.GetDescription());
-      s_pipeline_cache_path = {};
-    }
+    const std::string basename = GetShaderCacheBaseName("pipelines");
+    std::string filename = Path::Combine(base_path, TinyString::from_format("{}.bin", basename));
+    if (OpenPipelineCache(filename))
+      s_pipeline_cache_path = std::move(filename);
+    else
+      WARNING_LOG("Failed to read pipeline cache.");
   }
 }
 
@@ -516,11 +444,26 @@ void GPUDevice::CloseShaderCache()
 
   if (!s_pipeline_cache_path.empty())
   {
-    Error error;
-    if (!ClosePipelineCache(s_pipeline_cache_path, &error))
+    DynamicHeapArray<u8> data;
+    if (GetPipelineCacheData(&data))
     {
-      WARNING_LOG("Failed to close pipeline cache '{}': {}", Path::GetFileName(s_pipeline_cache_path),
-                  error.GetDescription());
+      // Save disk writes if it hasn't changed, think of the poor SSDs.
+      if (s_pipeline_cache_size != static_cast<s64>(data.size()) ||
+          s_pipeline_cache_hash != SHA1Digest::GetDigest(data.cspan()))
+      {
+        Error error;
+        INFO_LOG("Compressing and writing {} bytes to '{}'", data.size(), Path::GetFileName(s_pipeline_cache_path));
+        if (!CompressHelpers::CompressToFile(CompressHelpers::CompressType::Zstandard, s_pipeline_cache_path.c_str(),
+                                             data.cspan(), -1, true, &error))
+        {
+          ERROR_LOG("Failed to write pipeline cache to '{}': {}", Path::GetFileName(s_pipeline_cache_path),
+                    error.GetDescription());
+        }
+      }
+      else
+      {
+        INFO_LOG("Skipping updating pipeline cache '{}' due to no changes.", Path::GetFileName(s_pipeline_cache_path));
+      }
     }
 
     s_pipeline_cache_path = {};
@@ -531,70 +474,109 @@ std::string GPUDevice::GetShaderCacheBaseName(std::string_view type) const
 {
   const std::string_view debug_suffix = m_debug_device ? "_debug" : "";
 
-  TinyString lower_api_name(RenderAPIToString(m_render_api));
-  lower_api_name.convert_to_lower_case();
+  std::string ret;
+  switch (GetRenderAPI())
+  {
+#ifdef _WIN32
+    case RenderAPI::D3D11:
+      ret = fmt::format(
+        "d3d11_{}_{}{}", type,
+        D3DCommon::GetFeatureLevelShaderModelString(D3D11Device::GetInstance().GetD3DDevice()->GetFeatureLevel()),
+        debug_suffix);
+      break;
+    case RenderAPI::D3D12:
+      ret = fmt::format("d3d12_{}{}", type, debug_suffix);
+      break;
+#endif
+#ifdef ENABLE_VULKAN
+    case RenderAPI::Vulkan:
+      ret = fmt::format("vulkan_{}{}", type, debug_suffix);
+      break;
+#endif
+#ifdef ENABLE_OPENGL
+    case RenderAPI::OpenGL:
+      ret = fmt::format("opengl_{}{}", type, debug_suffix);
+      break;
+    case RenderAPI::OpenGLES:
+      ret = fmt::format("opengles_{}{}", type, debug_suffix);
+      break;
+#endif
+#ifdef __APPLE__
+    case RenderAPI::Metal:
+      ret = fmt::format("metal_{}{}", type, debug_suffix);
+      break;
+#endif
+    default:
+      UnreachableCode();
+      break;
+  }
 
-  return fmt::format("{}_{}{}", lower_api_name, type, debug_suffix);
+  return ret;
 }
 
-bool GPUDevice::OpenPipelineCache(const std::string& path, Error* error)
+bool GPUDevice::OpenPipelineCache(const std::string& filename)
 {
+  if (FileSystem::GetPathFileSize(filename.c_str()) <= 0)
+    return false;
+
+  Error error;
   CompressHelpers::OptionalByteBuffer data =
-    CompressHelpers::DecompressFile(CompressHelpers::CompressType::Zstandard, path.c_str(), std::nullopt, error);
+    CompressHelpers::DecompressFile(CompressHelpers::CompressType::Zstandard, filename.c_str(), std::nullopt, &error);
   if (!data.has_value())
+  {
+    ERROR_LOG("Failed to load pipeline cache from '{}': {}", Path::GetFileName(filename), error.GetDescription());
+    data.reset();
+  }
+
+  if (data.has_value())
+  {
+    s_pipeline_cache_size = data->size();
+    s_pipeline_cache_hash = SHA1Digest::GetDigest(data->cspan());
+  }
+  else
+  {
+    s_pipeline_cache_size = 0;
+    s_pipeline_cache_hash = {};
+  }
+
+  if (!ReadPipelineCache(std::move(data)))
+  {
+    s_pipeline_cache_size = 0;
+    s_pipeline_cache_hash = {};
     return false;
+  }
 
-  const size_t cache_size = data->size();
-  const std::array<u8, SHA1Digest::DIGEST_SIZE> cache_hash = SHA1Digest::GetDigest(data->cspan());
-
-  INFO_LOG("Loading {} byte pipeline cache with hash {}", cache_size, SHA1Digest::DigestToString(cache_hash));
-  if (!ReadPipelineCache(std::move(data.value()), error))
-    return false;
-
-  s_pipeline_cache_size = cache_size;
-  s_pipeline_cache_hash = cache_hash;
+  INFO_LOG("Pipeline cache hash: {}", SHA1Digest::DigestToString(s_pipeline_cache_hash));
   return true;
 }
 
-bool GPUDevice::CreatePipelineCache(const std::string& path, Error* error)
+bool GPUDevice::ReadPipelineCache(std::optional<DynamicHeapArray<u8>> data)
 {
   return false;
 }
 
-bool GPUDevice::ClosePipelineCache(const std::string& path, Error* error)
+bool GPUDevice::GetPipelineCacheData(DynamicHeapArray<u8>* data)
 {
-  DynamicHeapArray<u8> data;
-  if (!GetPipelineCacheData(&data, error))
+  return false;
+}
+
+bool GPUDevice::AcquireWindow(bool recreate_window)
+{
+  std::optional<WindowInfo> wi = Host::AcquireRenderWindow(recreate_window);
+  if (!wi.has_value())
     return false;
 
-  // Save disk writes if it hasn't changed, think of the poor SSDs.
-  if (s_pipeline_cache_size == data.size() && s_pipeline_cache_hash == SHA1Digest::GetDigest(data.cspan()))
-  {
-    INFO_LOG("Skipping updating pipeline cache '{}' due to no changes.", Path::GetFileName(path));
-    return true;
-  }
-
-  INFO_LOG("Compressing and writing {} bytes to '{}'", data.size(), Path::GetFileName(path));
-  return CompressHelpers::CompressToFile(CompressHelpers::CompressType::Zstandard, path.c_str(), data.cspan(), -1, true,
-                                         error);
-}
-
-bool GPUDevice::ReadPipelineCache(DynamicHeapArray<u8> data, Error* error)
-{
-  return false;
-}
-
-bool GPUDevice::GetPipelineCacheData(DynamicHeapArray<u8>* data, Error* error)
-{
-  return false;
+  INFO_LOG("Render window is {}x{}.", wi->surface_width, wi->surface_height);
+  m_window_info = wi.value();
+  return true;
 }
 
 bool GPUDevice::CreateResources(Error* error)
 {
-  if (!(m_nearest_sampler = CreateSampler(GPUSampler::GetNearestConfig(), error)) ||
-      !(m_linear_sampler = CreateSampler(GPUSampler::GetLinearConfig(), error)))
+  if (!(m_nearest_sampler = CreateSampler(GPUSampler::GetNearestConfig())) ||
+      !(m_linear_sampler = CreateSampler(GPUSampler::GetLinearConfig())))
   {
-    Error::AddPrefix(error, "Failed to create samplers: ");
+    Error::SetStringView(error, "Failed to create samplers");
     return false;
   }
 
@@ -632,7 +614,7 @@ bool GPUDevice::CreateResources(Error* error)
   plconfig.depth = GPUPipeline::DepthState::GetNoTestsState();
   plconfig.blend = GPUPipeline::BlendState::GetAlphaBlendingState();
   plconfig.blend.write_mask = 0x7;
-  plconfig.SetTargetFormats(m_main_swap_chain ? m_main_swap_chain->GetFormat() : GPUTexture::Format::RGBA8);
+  plconfig.SetTargetFormats(HasSurface() ? m_window_info.surface_format : GPUTexture::Format::RGBA8);
   plconfig.samples = 1;
   plconfig.per_sample_shading = false;
   plconfig.render_pass_flags = GPUPipeline::NoRenderPassFlags;
@@ -664,23 +646,23 @@ void GPUDevice::DestroyResources()
   m_shader_cache.Close();
 }
 
-void GPUDevice::RenderImGui(GPUSwapChain* swap_chain)
+void GPUDevice::RenderImGui()
 {
   GL_SCOPE("RenderImGui");
 
   ImGui::Render();
 
   const ImDrawData* draw_data = ImGui::GetDrawData();
-  if (draw_data->CmdListsCount == 0 || !swap_chain)
+  if (draw_data->CmdListsCount == 0)
     return;
 
   SetPipeline(m_imgui_pipeline.get());
-  SetViewportAndScissor(0, 0, swap_chain->GetWidth(), swap_chain->GetHeight());
+  SetViewportAndScissor(0, 0, m_window_info.surface_width, m_window_info.surface_height);
 
   const float L = 0.0f;
-  const float R = static_cast<float>(swap_chain->GetWidth());
+  const float R = static_cast<float>(m_window_info.surface_width);
   const float T = 0.0f;
-  const float B = static_cast<float>(swap_chain->GetHeight());
+  const float B = static_cast<float>(m_window_info.surface_height);
   const float ortho_projection[4][4] = {
     {2.0f / (R - L), 0.0f, 0.0f, 0.0f},
     {0.0f, 2.0f / (T - B), 0.0f, 0.0f},
@@ -711,7 +693,8 @@ void GPUDevice::RenderImGui(GPUSwapChain* swap_chain)
       if (flip)
       {
         const s32 height = static_cast<s32>(pcmd->ClipRect.w - pcmd->ClipRect.y);
-        const s32 flipped_y = static_cast<s32>(swap_chain->GetHeight()) - static_cast<s32>(pcmd->ClipRect.y) - height;
+        const s32 flipped_y =
+          static_cast<s32>(m_window_info.surface_height) - static_cast<s32>(pcmd->ClipRect.y) - height;
         SetScissor(static_cast<s32>(pcmd->ClipRect.x), flipped_y, static_cast<s32>(pcmd->ClipRect.z - pcmd->ClipRect.x),
                    height);
       }
@@ -833,59 +816,69 @@ std::unique_ptr<GPUShader> GPUDevice::CreateShader(GPUShaderStage stage, GPUShad
   return shader;
 }
 
-std::optional<GPUDevice::ExclusiveFullscreenMode> GPUDevice::ExclusiveFullscreenMode::Parse(std::string_view str)
+bool GPUDevice::GetRequestedExclusiveFullscreenMode(u32* width, u32* height, float* refresh_rate)
 {
-  std::optional<ExclusiveFullscreenMode> ret;
-  std::string_view::size_type sep1 = str.find('x');
-  if (sep1 != std::string_view::npos)
+  const std::string mode = Host::GetBaseStringSettingValue("GPU", "FullscreenMode", "");
+  if (!mode.empty())
   {
-    std::optional<u32> owidth = StringUtil::FromChars<u32>(str.substr(0, sep1));
-    sep1++;
-
-    while (sep1 < str.length() && std::isspace(str[sep1]))
+    const std::string_view mode_view = mode;
+    std::string_view::size_type sep1 = mode.find('x');
+    if (sep1 != std::string_view::npos)
+    {
+      std::optional<u32> owidth = StringUtil::FromChars<u32>(mode_view.substr(0, sep1));
       sep1++;
 
-    if (owidth.has_value() && sep1 < str.length())
-    {
-      std::string_view::size_type sep2 = str.find('@', sep1);
-      if (sep2 != std::string_view::npos)
-      {
-        std::optional<u32> oheight = StringUtil::FromChars<u32>(str.substr(sep1, sep2 - sep1));
-        sep2++;
+      while (sep1 < mode.length() && std::isspace(mode[sep1]))
+        sep1++;
 
-        while (sep2 < str.length() && std::isspace(str[sep2]))
+      if (owidth.has_value() && sep1 < mode.length())
+      {
+        std::string_view::size_type sep2 = mode.find('@', sep1);
+        if (sep2 != std::string_view::npos)
+        {
+          std::optional<u32> oheight = StringUtil::FromChars<u32>(mode_view.substr(sep1, sep2 - sep1));
           sep2++;
 
-        if (oheight.has_value() && sep2 < str.length())
-        {
-          std::optional<float> orefresh_rate = StringUtil::FromChars<float>(str.substr(sep2));
-          if (orefresh_rate.has_value())
+          while (sep2 < mode.length() && std::isspace(mode[sep2]))
+            sep2++;
+
+          if (oheight.has_value() && sep2 < mode.length())
           {
-            ret = ExclusiveFullscreenMode{
-              .width = owidth.value(), .height = oheight.value(), .refresh_rate = orefresh_rate.value()};
+            std::optional<float> orefresh_rate = StringUtil::FromChars<float>(mode_view.substr(sep2));
+            if (orefresh_rate.has_value())
+            {
+              *width = owidth.value();
+              *height = oheight.value();
+              *refresh_rate = orefresh_rate.value();
+              return true;
+            }
           }
         }
       }
     }
   }
 
-  return ret;
+  *width = 0;
+  *height = 0;
+  *refresh_rate = 0;
+  return false;
 }
 
-TinyString GPUDevice::ExclusiveFullscreenMode::ToString() const
+std::string GPUDevice::GetFullscreenModeString(u32 width, u32 height, float refresh_rate)
 {
-  return TinyString::from_format("{} x {} @ {} hz", width, height, refresh_rate);
+  return fmt::format("{} x {} @ {} hz", width, height, refresh_rate);
+}
+
+std::string GPUDevice::GetShaderDumpPath(std::string_view name)
+{
+  return Path::Combine(EmuFolders::Dumps, name);
 }
 
 void GPUDevice::DumpBadShader(std::string_view code, std::string_view errors)
 {
   static u32 next_bad_shader_id = 0;
 
-  if (s_shader_dump_path.empty())
-    return;
-
-  const std::string filename =
-    Path::Combine(s_shader_dump_path, TinyString::from_format("bad_shader_{}.txt", ++next_bad_shader_id));
+  const std::string filename = GetShaderDumpPath(fmt::format("bad_shader_{}.txt", ++next_bad_shader_id));
   auto fp = FileSystem::OpenManagedCFile(filename.c_str(), "wb");
   if (fp)
   {
@@ -923,15 +916,10 @@ bool GPUDevice::UpdateImGuiFontTexture()
     return true;
   }
 
-  Error error;
   std::unique_ptr<GPUTexture> new_font =
-    FetchTexture(width, height, 1, 1, 1, GPUTexture::Type::Texture, GPUTexture::Format::RGBA8, GPUTexture::Flags::None,
-                 pixels, pitch, &error);
-  if (!new_font) [[unlikely]]
-  {
-    ERROR_LOG("Failed to create new ImGui font texture: {}", error.GetDescription());
+    FetchTexture(width, height, 1, 1, 1, GPUTexture::Type::Texture, GPUTexture::Format::RGBA8, pixels, pitch);
+  if (!new_font)
     return false;
-  }
 
   RecycleTexture(std::move(m_imgui_font_texture));
   m_imgui_font_texture = std::move(new_font);
@@ -956,13 +944,12 @@ GSVector4i GPUDevice::FlipToLowerLeft(GSVector4i rc, s32 target_height)
 
 bool GPUDevice::IsTexturePoolType(GPUTexture::Type type)
 {
-  return (type == GPUTexture::Type::Texture);
+  return (type == GPUTexture::Type::Texture || type == GPUTexture::Type::DynamicTexture);
 }
 
 std::unique_ptr<GPUTexture> GPUDevice::FetchTexture(u32 width, u32 height, u32 layers, u32 levels, u32 samples,
                                                     GPUTexture::Type type, GPUTexture::Format format,
-                                                    GPUTexture::Flags flags, const void* data /* = nullptr */,
-                                                    u32 data_stride /* = 0 */, Error* error /* = nullptr */)
+                                                    const void* data /*= nullptr*/, u32 data_stride /*= 0*/)
 {
   std::unique_ptr<GPUTexture> ret;
 
@@ -973,7 +960,7 @@ std::unique_ptr<GPUTexture> GPUDevice::FetchTexture(u32 width, u32 height, u32 l
                               static_cast<u8>(samples),
                               type,
                               format,
-                              flags};
+                              0u};
 
   const bool is_texture = IsTexturePoolType(type);
   TexturePool& pool = is_texture ? m_texture_pool : m_target_pool;
@@ -1025,65 +1012,18 @@ std::unique_ptr<GPUTexture> GPUDevice::FetchTexture(u32 width, u32 height, u32 l
     }
   }
 
-  Error create_error;
-  ret = CreateTexture(width, height, layers, levels, samples, type, format, flags, data, data_stride, &create_error);
-  if (!ret) [[unlikely]]
-  {
-    Error::SetStringFmt(
-      error ? error : &create_error, "Failed to create {}x{} {} {}: {}", width, height,
-      GPUTexture::GetFormatName(format),
-      ((type == GPUTexture::Type::RenderTarget) ? "RT" : (type == GPUTexture::Type::DepthStencil ? "DS" : "Texture")),
-      create_error.TakeDescription());
-    if (!error)
-      ERROR_LOG(create_error.GetDescription());
-  }
-
+  ret = CreateTexture(width, height, layers, levels, samples, type, format, data, data_stride);
   return ret;
 }
 
 std::unique_ptr<GPUTexture, GPUDevice::PooledTextureDeleter>
 GPUDevice::FetchAutoRecycleTexture(u32 width, u32 height, u32 layers, u32 levels, u32 samples, GPUTexture::Type type,
-                                   GPUTexture::Format format, GPUTexture::Flags flags, const void* data /* = nullptr */,
-                                   u32 data_stride /* = 0 */, Error* error /* = nullptr */)
+                                   GPUTexture::Format format, const void* data /*= nullptr*/, u32 data_stride /*= 0*/,
+                                   bool dynamic /*= false*/)
 {
   std::unique_ptr<GPUTexture> ret =
-    FetchTexture(width, height, layers, levels, samples, type, format, flags, data, data_stride, error);
+    FetchTexture(width, height, layers, levels, samples, type, format, data, data_stride);
   return std::unique_ptr<GPUTexture, PooledTextureDeleter>(ret.release());
-}
-
-std::unique_ptr<GPUTexture> GPUDevice::FetchAndUploadTextureImage(const Image& image,
-                                                                  GPUTexture::Flags flags /*= GPUTexture::Flags::None*/,
-                                                                  Error* error /*= nullptr*/)
-{
-  const Image* image_to_upload = &image;
-  GPUTexture::Format gpu_format = GPUTexture::GetTextureFormatForImageFormat(image.GetFormat());
-  bool gpu_format_supported;
-
-  // avoid device query for compressed formats that we've already pretested
-  if (gpu_format >= GPUTexture::Format::BC1 && gpu_format <= GPUTexture::Format::BC3)
-    gpu_format_supported = m_features.dxt_textures;
-  else if (gpu_format == GPUTexture::Format::BC7)
-    gpu_format_supported = m_features.bptc_textures;
-  else if (gpu_format == GPUTexture::Format::RGBA8) // always supported
-    gpu_format_supported = true;
-  else if (gpu_format != GPUTexture::Format::Unknown)
-    gpu_format_supported = SupportsTextureFormat(gpu_format);
-  else
-    gpu_format_supported = false;
-
-  std::optional<Image> converted_image;
-  if (!gpu_format_supported)
-  {
-    converted_image = image.ConvertToRGBA8(error);
-    if (!converted_image.has_value())
-      return nullptr;
-
-    image_to_upload = &converted_image.value();
-    gpu_format = GPUTexture::GetTextureFormatForImageFormat(converted_image->GetFormat());
-  }
-
-  return FetchTexture(image_to_upload->GetWidth(), image_to_upload->GetHeight(), 1, 1, 1, GPUTexture::Type::Texture,
-                      gpu_format, flags, image_to_upload->GetPixels(), image_to_upload->GetPitch(), error);
 }
 
 void GPUDevice::RecycleTexture(std::unique_ptr<GPUTexture> texture)
@@ -1098,7 +1038,7 @@ void GPUDevice::RecycleTexture(std::unique_ptr<GPUTexture> texture)
                               static_cast<u8>(texture->GetSamples()),
                               texture->GetType(),
                               texture->GetFormat(),
-                              texture->GetFlags()};
+                              0u};
 
   const bool is_texture = IsTexturePoolType(texture->GetType());
   TexturePool& pool = is_texture ? m_texture_pool : m_target_pool;
@@ -1172,11 +1112,11 @@ void GPUDevice::TrimTexturePool()
 }
 
 bool GPUDevice::ResizeTexture(std::unique_ptr<GPUTexture>* tex, u32 new_width, u32 new_height, GPUTexture::Type type,
-                              GPUTexture::Format format, GPUTexture::Flags flags, bool preserve /* = true */)
+                              GPUTexture::Format format, bool preserve /* = true */)
 {
   GPUTexture* old_tex = tex->get();
   DebugAssert(!old_tex || (old_tex->GetLayers() == 1 && old_tex->GetLevels() == 1 && old_tex->GetSamples() == 1));
-  std::unique_ptr<GPUTexture> new_tex = FetchTexture(new_width, new_height, 1, 1, 1, type, format, flags);
+  std::unique_ptr<GPUTexture> new_tex = FetchTexture(new_width, new_height, 1, 1, 1, type, format);
   if (!new_tex) [[unlikely]]
   {
     ERROR_LOG("Failed to create new {}x{} texture", new_width, new_height);
@@ -1209,6 +1149,42 @@ bool GPUDevice::ResizeTexture(std::unique_ptr<GPUTexture>* tex, u32 new_width, u
   RecycleTexture(std::move(*tex));
   *tex = std::move(new_tex);
   return true;
+}
+
+bool GPUDevice::ShouldSkipPresentingFrame()
+{
+  // Only needed with FIFO. But since we're so fast, we allow it always.
+  if (!m_allow_present_throttle)
+    return false;
+
+  const float throttle_rate = (m_window_info.surface_refresh_rate > 0.0f) ? m_window_info.surface_refresh_rate : 60.0f;
+  const float throttle_period = 1.0f / throttle_rate;
+
+  const u64 now = Common::Timer::GetCurrentValue();
+  const double diff = Common::Timer::ConvertValueToSeconds(now - m_last_frame_displayed_time);
+  if (diff < throttle_period)
+    return true;
+
+  m_last_frame_displayed_time = now;
+  return false;
+}
+
+void GPUDevice::ThrottlePresentation()
+{
+  const float throttle_rate = (m_window_info.surface_refresh_rate > 0.0f) ? m_window_info.surface_refresh_rate : 60.0f;
+
+  const u64 sleep_period = Common::Timer::ConvertNanosecondsToValue(1e+9f / static_cast<double>(throttle_rate));
+  const u64 current_ts = Common::Timer::GetCurrentValue();
+
+  // Allow it to fall behind/run ahead up to 2*period. Sleep isn't that precise, plus we need to
+  // allow time for the actual rendering.
+  const u64 max_variance = sleep_period * 2;
+  if (static_cast<u64>(std::abs(static_cast<s64>(current_ts - m_last_frame_displayed_time))) > max_variance)
+    m_last_frame_displayed_time = current_ts + sleep_period;
+  else
+    m_last_frame_displayed_time += sleep_period;
+
+  Common::Timer::SleepUntil(m_last_frame_displayed_time, false);
 }
 
 bool GPUDevice::SetGPUTimingEnabled(bool enabled)
@@ -1259,13 +1235,6 @@ std::unique_ptr<GPUDevice> GPUDevice::CreateDeviceForAPI(RenderAPI api)
   }
 }
 
-#ifndef _WIN32
-// Use a duckstation-suffixed shaderc name to avoid conflicts and loading another shaderc, e.g. from the Vulkan SDK.
-#define SHADERC_LIB_NAME "shaderc_ds"
-#else
-#define SHADERC_LIB_NAME "shaderc_shared"
-#endif
-
 #define SHADERC_FUNCTIONS(X)                                                                                           \
   X(shaderc_compiler_initialize)                                                                                       \
   X(shaderc_compiler_release)                                                                                          \
@@ -1282,8 +1251,7 @@ std::unique_ptr<GPUDevice> GPUDevice::CreateDeviceForAPI(RenderAPI api)
   X(shaderc_result_get_num_warnings)                                                                                   \
   X(shaderc_result_get_bytes)                                                                                          \
   X(shaderc_result_get_compilation_status)                                                                             \
-  X(shaderc_result_get_error_message)                                                                                  \
-  X(shaderc_optimize_spv)
+  X(shaderc_result_get_error_message)
 
 #define SPIRV_CROSS_FUNCTIONS(X)                                                                                       \
   X(spvc_context_create)                                                                                               \
@@ -1341,7 +1309,7 @@ bool dyn_libs::OpenShaderc(Error* error)
   if (s_shaderc_library.IsOpen())
     return true;
 
-  const std::string libname = DynamicLibrary::GetVersionedFilename(SHADERC_LIB_NAME);
+  const std::string libname = DynamicLibrary::GetVersionedFilename("shaderc_shared");
   if (!s_shaderc_library.Open(libname.c_str(), error))
   {
     Error::AddPrefix(error, "Failed to load shaderc: ");
@@ -1451,63 +1419,6 @@ void dyn_libs::CloseAll()
 #undef SPIRV_CROSS_MSL_FUNCTIONS
 #undef SPIRV_CROSS_FUNCTIONS
 #undef SHADERC_FUNCTIONS
-
-std::optional<DynamicHeapArray<u8>> GPUDevice::OptimizeVulkanSpv(const std::span<const u8> spirv, Error* error)
-{
-  std::optional<DynamicHeapArray<u8>> ret;
-
-  if (spirv.size() < sizeof(u32) * 2)
-  {
-    Error::SetStringView(error, "Invalid SPIR-V input size.");
-    return ret;
-  }
-
-  // Need to set environment based on version.
-  u32 magic_word, spirv_version;
-  shaderc_target_env target_env = shaderc_target_env_vulkan;
-  shaderc_env_version target_version = shaderc_env_version_vulkan_1_0;
-  std::memcpy(&magic_word, spirv.data(), sizeof(magic_word));
-  std::memcpy(&spirv_version, spirv.data() + sizeof(magic_word), sizeof(spirv_version));
-  if (magic_word != 0x07230203u)
-  {
-    Error::SetStringView(error, "Invalid SPIR-V magic word.");
-    return ret;
-  }
-  if (spirv_version < 0x10300)
-    target_version = shaderc_env_version_vulkan_1_0;
-  else
-    target_version = shaderc_env_version_vulkan_1_1;
-
-  if (!dyn_libs::OpenShaderc(error))
-    return ret;
-
-  const shaderc_compile_options_t options = dyn_libs::shaderc_compile_options_initialize();
-  AssertMsg(options, "shaderc_compile_options_initialize() failed");
-  dyn_libs::shaderc_compile_options_set_target_env(options, target_env, target_version);
-  dyn_libs::shaderc_compile_options_set_optimization_level(options, shaderc_optimization_level_performance);
-
-  const shaderc_compilation_result_t result =
-    dyn_libs::shaderc_optimize_spv(dyn_libs::s_shaderc_compiler, spirv.data(), spirv.size(), options);
-  const shaderc_compilation_status status =
-    result ? dyn_libs::shaderc_result_get_compilation_status(result) : shaderc_compilation_status_internal_error;
-  if (status != shaderc_compilation_status_success)
-  {
-    const std::string_view errors(result ? dyn_libs::shaderc_result_get_error_message(result) : "null result object");
-    Error::SetStringFmt(error, "Failed to optimize SPIR-V: {}\n{}",
-                        dyn_libs::shaderc_compilation_status_to_string(status), errors);
-  }
-  else
-  {
-    const size_t spirv_size = dyn_libs::shaderc_result_get_length(result);
-    DebugAssert(spirv_size > 0);
-    ret = DynamicHeapArray<u8>(spirv_size);
-    std::memcpy(ret->data(), dyn_libs::shaderc_result_get_bytes(result), spirv_size);
-  }
-
-  dyn_libs::shaderc_result_release(result);
-  dyn_libs::shaderc_compile_options_release(options);
-  return ret;
-}
 
 bool GPUDevice::CompileGLSLShaderToVulkanSpv(GPUShaderStage stage, GPUShaderLanguage source_language,
                                              std::string_view source, const char* entry_point, bool optimization,
@@ -1633,22 +1544,17 @@ bool GPUDevice::TranslateVulkanSpvToLanguage(const std::span<const u8> spirv, GP
 
   // Need to know if there's UBOs for mapping.
   const spvc_reflected_resource *ubos, *textures;
-  size_t ubos_count, textures_count, images_count;
+  size_t ubos_count, textures_count;
   if ((sres = dyn_libs::spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, &ubos,
                                                                   &ubos_count)) != SPVC_SUCCESS ||
       (sres = dyn_libs::spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
-                                                                  &textures, &textures_count)) != SPVC_SUCCESS ||
-      (sres = dyn_libs::spvc_resources_get_resource_list_for_type(resources, SPVC_RESOURCE_TYPE_STORAGE_IMAGE,
-                                                                  &textures, &images_count)) != SPVC_SUCCESS)
+                                                                  &textures, &textures_count)) != SPVC_SUCCESS)
   {
     Error::SetStringFmt(error, "spvc_resources_get_resource_list_for_type() failed: {}", static_cast<int>(sres));
     return {};
   }
 
   [[maybe_unused]] const SpvExecutionModel execmodel = dyn_libs::spvc_compiler_get_execution_model(scompiler);
-  [[maybe_unused]] static constexpr u32 UBO_DESCRIPTOR_SET = 0;
-  [[maybe_unused]] static constexpr u32 TEXTURE_DESCRIPTOR_SET = 1;
-  [[maybe_unused]] static constexpr u32 IMAGE_DESCRIPTOR_SET = 2;
 
   switch (target_language)
   {
@@ -1673,24 +1579,13 @@ bool GPUDevice::TranslateVulkanSpvToLanguage(const std::span<const u8> spirv, GP
         return {};
       }
 
-      if ((sres = dyn_libs::spvc_compiler_options_set_bool(soptions, SPVC_COMPILER_OPTION_HLSL_POINT_SIZE_COMPAT,
-                                                           true)) != SPVC_SUCCESS)
-      {
-        Error::SetStringFmt(error,
-                            "spvc_compiler_options_set_bool(SPVC_COMPILER_OPTION_HLSL_POINT_SIZE_COMPAT) failed: {}",
-                            static_cast<int>(sres));
-        return {};
-      }
-
+      u32 start_set = 0;
       if (ubos_count > 0)
       {
         const spvc_hlsl_resource_binding rb = {.stage = execmodel,
-                                               .desc_set = UBO_DESCRIPTOR_SET,
+                                               .desc_set = start_set++,
                                                .binding = 0,
-                                               .cbv = {.register_space = 0, .register_binding = 0},
-                                               .uav = {},
-                                               .srv = {},
-                                               .sampler = {}};
+                                               .cbv = {.register_space = 0, .register_binding = 0}};
         if ((sres = dyn_libs::spvc_compiler_hlsl_add_resource_binding(scompiler, &rb)) != SPVC_SUCCESS)
         {
           Error::SetStringFmt(error, "spvc_compiler_hlsl_add_resource_binding() failed: {}", static_cast<int>(sres));
@@ -1700,34 +1595,13 @@ bool GPUDevice::TranslateVulkanSpvToLanguage(const std::span<const u8> spirv, GP
 
       if (textures_count > 0)
       {
-        for (u32 i = 0; i < textures_count; i++)
+        for (u32 i = 0; i < MAX_TEXTURE_SAMPLERS; i++)
         {
           const spvc_hlsl_resource_binding rb = {.stage = execmodel,
-                                                 .desc_set = TEXTURE_DESCRIPTOR_SET,
+                                                 .desc_set = start_set++,
                                                  .binding = i,
-                                                 .cbv = {},
-                                                 .uav = {},
                                                  .srv = {.register_space = 0, .register_binding = i},
                                                  .sampler = {.register_space = 0, .register_binding = i}};
-          if ((sres = dyn_libs::spvc_compiler_hlsl_add_resource_binding(scompiler, &rb)) != SPVC_SUCCESS)
-          {
-            Error::SetStringFmt(error, "spvc_compiler_hlsl_add_resource_binding() failed: {}", static_cast<int>(sres));
-            return {};
-          }
-        }
-      }
-
-      if (stage == GPUShaderStage::Compute)
-      {
-        for (u32 i = 0; i < images_count; i++)
-        {
-          const spvc_hlsl_resource_binding rb = {.stage = execmodel,
-                                                 .desc_set = IMAGE_DESCRIPTOR_SET,
-                                                 .binding = i,
-                                                 .cbv = {},
-                                                 .uav = {.register_space = 0, .register_binding = i},
-                                                 .srv = {},
-                                                 .sampler = {}};
           if ((sres = dyn_libs::spvc_compiler_hlsl_add_resource_binding(scompiler, &rb)) != SPVC_SUCCESS)
           {
             Error::SetStringFmt(error, "spvc_compiler_hlsl_add_resource_binding() failed: {}", static_cast<int>(sres));
@@ -1796,32 +1670,19 @@ bool GPUDevice::TranslateVulkanSpvToLanguage(const std::span<const u8> spirv, GP
 
       if (m_features.framebuffer_fetch &&
           ((sres = dyn_libs::spvc_compiler_options_set_uint(soptions, SPVC_COMPILER_OPTION_MSL_VERSION,
-                                                            target_version)) != SPVC_SUCCESS))
+                                                            SPVC_MAKE_MSL_VERSION(2, 3, 0))) != SPVC_SUCCESS))
       {
         Error::SetStringFmt(error, "spvc_compiler_options_set_uint(SPVC_COMPILER_OPTION_MSL_VERSION) failed: {}",
                             static_cast<int>(sres));
         return {};
       }
 
-      const spvc_msl_resource_binding pc_rb = {.stage = execmodel,
-                                               .desc_set = SPVC_MSL_PUSH_CONSTANT_DESC_SET,
-                                               .binding = SPVC_MSL_PUSH_CONSTANT_BINDING,
-                                               .msl_buffer = 0,
-                                               .msl_texture = 0,
-                                               .msl_sampler = 0};
-      if ((sres = dyn_libs::spvc_compiler_msl_add_resource_binding(scompiler, &pc_rb)) != SPVC_SUCCESS)
-      {
-        Error::SetStringFmt(error, "spvc_compiler_msl_add_resource_binding() for push constant failed: {}",
-                            static_cast<int>(sres));
-        return {};
-      }
-
-      if (stage == GPUShaderStage::Fragment || stage == GPUShaderStage::Compute)
+      if (stage == GPUShaderStage::Fragment)
       {
         for (u32 i = 0; i < MAX_TEXTURE_SAMPLERS; i++)
         {
-          const spvc_msl_resource_binding rb = {.stage = execmodel,
-                                                .desc_set = TEXTURE_DESCRIPTOR_SET,
+          const spvc_msl_resource_binding rb = {.stage = SpvExecutionModelFragment,
+                                                .desc_set = 1,
                                                 .binding = i,
                                                 .msl_buffer = i,
                                                 .msl_texture = i,
@@ -1833,31 +1694,16 @@ bool GPUDevice::TranslateVulkanSpvToLanguage(const std::span<const u8> spirv, GP
             return {};
           }
         }
-      }
 
-      if (stage == GPUShaderStage::Fragment && !m_features.framebuffer_fetch)
-      {
-        const spvc_msl_resource_binding rb = {
-          .stage = execmodel, .desc_set = 2, .binding = 0, .msl_texture = MAX_TEXTURE_SAMPLERS};
-
-        if ((sres = dyn_libs::spvc_compiler_msl_add_resource_binding(scompiler, &rb)) != SPVC_SUCCESS)
-        {
-          Error::SetStringFmt(error, "spvc_compiler_msl_add_resource_binding() for FB failed: {}",
-                              static_cast<int>(sres));
-          return {};
-        }
-      }
-
-      if (stage == GPUShaderStage::Compute)
-      {
-        for (u32 i = 0; i < MAX_IMAGE_RENDER_TARGETS; i++)
+        if (!m_features.framebuffer_fetch)
         {
           const spvc_msl_resource_binding rb = {
-            .stage = execmodel, .desc_set = 2, .binding = i, .msl_buffer = i, .msl_texture = i, .msl_sampler = i};
+            .stage = SpvExecutionModelFragment, .desc_set = 2, .binding = 0, .msl_texture = MAX_TEXTURE_SAMPLERS};
 
           if ((sres = dyn_libs::spvc_compiler_msl_add_resource_binding(scompiler, &rb)) != SPVC_SUCCESS)
           {
-            Error::SetStringFmt(error, "spvc_compiler_msl_add_resource_binding() failed: {}", static_cast<int>(sres));
+            Error::SetStringFmt(error, "spvc_compiler_msl_add_resource_binding() for FB failed: {}",
+                                static_cast<int>(sres));
             return {};
           }
         }
@@ -1899,68 +1745,18 @@ std::unique_ptr<GPUShader> GPUDevice::TranspileAndCreateShaderFromSource(
   GPUShaderStage stage, GPUShaderLanguage source_language, std::string_view source, const char* entry_point,
   GPUShaderLanguage target_language, u32 target_version, DynamicHeapArray<u8>* out_binary, Error* error)
 {
-  // Currently, entry points must be "main". TODO: rename the entry point in the SPIR-V.
-  if (std::strcmp(entry_point, "main") != 0)
-  {
-    Error::SetStringView(error, "Entry point must be main.");
-    return {};
-  }
-
   // Disable optimization when targeting OpenGL GLSL, otherwise, the name-based linking will fail.
   const bool optimization =
-    (!m_debug_device && target_language != GPUShaderLanguage::GLSL && target_language != GPUShaderLanguage::GLSLES);
-
-  std::span<const u8> spv;
-  DynamicHeapArray<u8> intermediate_spv;
-  if (source_language == GPUShaderLanguage::GLSLVK)
-  {
-    if (!CompileGLSLShaderToVulkanSpv(stage, source_language, source, entry_point, optimization, false,
-                                      &intermediate_spv, error))
-    {
-      return {};
-    }
-
-    spv = intermediate_spv.cspan();
-  }
-  else if (source_language == GPUShaderLanguage::SPV)
-  {
-    spv = std::span<const u8>(reinterpret_cast<const u8*>(source.data()), source.size());
-
-    if (optimization)
-    {
-      Error optimize_error;
-      std::optional<DynamicHeapArray<u8>> optimized_spv = GPUDevice::OptimizeVulkanSpv(spv, &optimize_error);
-      if (!optimized_spv.has_value())
-      {
-        WARNING_LOG("Failed to optimize SPIR-V: {}", optimize_error.GetDescription());
-      }
-      else
-      {
-        DEV_LOG("SPIR-V optimized from {} bytes to {} bytes", source.length(), optimized_spv->size());
-        intermediate_spv = std::move(optimized_spv.value());
-        spv = intermediate_spv.cspan();
-      }
-    }
-  }
-  else
-  {
-    Error::SetStringFmt(error, "Unsupported source language for transpile: {}",
-                        ShaderLanguageToString(source_language));
+    (target_language != GPUShaderLanguage::GLSL && target_language != GPUShaderLanguage::GLSLES);
+  DynamicHeapArray<u8> spv;
+  if (!CompileGLSLShaderToVulkanSpv(stage, source_language, source, entry_point, optimization, false, &spv, error))
     return {};
-  }
 
   std::string dest_source;
-  if (!TranslateVulkanSpvToLanguage(spv, stage, target_language, target_version, &dest_source, error))
+  if (!TranslateVulkanSpvToLanguage(spv.cspan(), stage, target_language, target_version, &dest_source, error))
     return {};
 
-#ifdef __APPLE__
-  // MSL converter suffixes 0.
-  if (target_language == GPUShaderLanguage::MSL)
-  {
-    return CreateShaderFromSource(stage, target_language, dest_source,
-                                  TinyString::from_format("{}0", entry_point).c_str(), out_binary, error);
-  }
-#endif
+  // TODO: MSL needs entry point suffixed.
 
   return CreateShaderFromSource(stage, target_language, dest_source, entry_point, out_binary, error);
 }
