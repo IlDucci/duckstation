@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: CC-BY-NC-ND-4.0
+// SPDX-License-Identifier: (GPL-3.0 OR PolyForm-Strict-1.0.0)
 
 #include "sha1_digest.h"
 #include "assert.h"
@@ -161,7 +161,7 @@ void SHA1Digest::Reset()
   count[0] = count[1] = 0;
 }
 
-std::string SHA1Digest::DigestToString(const std::span<const u8, DIGEST_SIZE> digest)
+std::string SHA1Digest::DigestToString(const std::span<u8, DIGEST_SIZE> digest)
 {
   return StringUtil::EncodeHex<u8>(digest);
 }
